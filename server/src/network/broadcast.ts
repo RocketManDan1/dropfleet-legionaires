@@ -146,3 +146,17 @@ export function buildTickUpdate(
     events,
   };
 }
+
+/**
+ * Broadcast current game state delta to all connected players.
+ * Milestone 2 stub — full fog-of-war filtering and compression added there.
+ * @param session - The active GameSession (typed as `any` to avoid circular import).
+ * @param tickEvents - Events generated this tick.
+ * @param tick - Current tick number.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function broadcastGameState(_session: any, _tickEvents: unknown[], _tick: number): void {
+  // TODO (Milestone 2): Iterate session.getConnectedPlayers(), compute per-player
+  // unit/contact deltas, build TickUpdatePayload, serialise and send.
+  // For now, no-op — M1 uses direct WS messages in index.ts.
+}

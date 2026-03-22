@@ -404,7 +404,7 @@ export function updateSpotting(
       // Post-accumulation clamp: size-0 targets cannot be pushed past SUSPECTED
       // by observers with visionM < 750, unless the target fired this tick.
       // See Spotting and Contact Model §Concealment and Size.
-      const targetSize = 3; // TODO: Replace with UnitType.size lookup
+      const targetSize: number = 3; // TODO: Replace with UnitType.size lookup
       if (
         targetSize === 0 &&
         observerVisionM < SIZE_ZERO_VISION_CAP &&

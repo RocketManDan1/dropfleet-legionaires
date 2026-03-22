@@ -55,7 +55,7 @@ These files are consumed by both client and server. They're already complete —
 
 **Goal:** 20Hz server tick loop, WebSocket connection, multiple units, movement/fire/LOS/spotting/combat/suppression/morale. Single-player with hardcoded spawns.
 
-**Design docs:** SERVER_GAME_LOOP.md, Combat Formula Spec.md, Spotting and Contact Model.md, Orders and C2 Interaction.md, NETWORK_PROTOCOL.md, RUNTIME_UNIT_STATE.md, Simulation Time Model.md, Unit Schema Spec.md
+**Design docs:** SERVER_GAME_LOOP.md, Combat Formula Spec.md, Spotting and Contact Model.md, Orders and C2 Interaction.md, NETWORK_PROTOCOL.md, RUNTIME_UNIT_STATE.md, Simulation Time Model.md, Unit Schema Spec.md, server/BATLOC_TERRAIN_SPEC.md, server/TERRAIN_GENERATOR_AUDIT.md, server/TERRAIN_IMPLEMENTATION_PLAN.md
 
 ### Server
 
@@ -74,6 +74,20 @@ These files are consumed by both client and server. They're already complete —
 | `server/src/systems/supply.ts` | Supply range check, ammo trickle resupply | Phase 8 |
 | `server/src/network/protocol.ts` | Message parsing, serialization, fog-of-war filtering | Phase 9 |
 | `server/src/network/broadcast.ts` | Delta encoding, state snapshot capture | Phase 9 |
+
+### Terrain Track (M2 Foundation)
+
+Use these docs as mandatory references while implementing M2 server terrain evolution:
+
+- `server/BATLOC_TERRAIN_SPEC.md` — BatLoc params, terrain enum/movement costs, extended `TerrainData`, protocol shape
+- `server/TERRAIN_GENERATOR_AUDIT.md` — identified terrain/protocol gaps and priority ordering
+- `server/TERRAIN_IMPLEMENTATION_PLAN.md` — staged execution plan (A→E), invariants, determinism, validation checklist
+
+Minimum M2 terrain deliverables:
+
+1. Data scaffolding: `BatLocParams`, preset resolver, strict `generate` parser, invariant validation hook
+2. Payload contract extension: include `terrainTypeMap`, `rivers`, `roads`, `bridges`, `fords`, `spawnZones`, `objectives`, `batloc`
+3. Backward compatibility: keep existing continuous maps while new fields are introduced
 
 ### Client
 
@@ -197,14 +211,14 @@ Additional work in this milestone is primarily extensions to existing files (add
 
 ```bash
 # Install all workspace dependencies
-npm install
+pnpm install
 
 # Run the dev server (20Hz tick loop + WebSocket)
-npm run dev:server
+pnpm run dev:server
 
 # Run the client (Vite dev server with HMR)
-npm run dev:client
+pnpm run dev:client
 
 # Build everything
-npm run build
+pnpm run build
 ```

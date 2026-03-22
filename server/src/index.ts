@@ -1,24 +1,9 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { generateTerrain, TerrainData } from './terrain.js';
+import { parseGenerateRequest } from './protocol.js';
+import { validateTerrainData } from './validation.js';
 
 const PORT = 3000;
-const MIN_MAP_SIZE = 128;
-const MAX_MAP_SIZE = 768;
-
-function parseMapSize(value: unknown, fallback: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return fallback;
-  }
-  return Math.max(MIN_MAP_SIZE, Math.min(MAX_MAP_SIZE, Math.floor(value)));
-}
-
-function parseSeed(value: unknown): number | undefined {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return undefined;
-  }
-  return value;
-}
-
 // Generate terrain once at startup
 console.log('Generating terrain...');
 let terrain: TerrainData = generateTerrain(512, 512);
@@ -45,12 +30,36 @@ wss.on('connection', (ws: WebSocket) => {
       }
 
       if (msg.type === 'generate') {
-        const width = parseMapSize(msg.width, terrain.width);
-        const height = parseMapSize(msg.height, terrain.height);
-        const seed = parseSeed(msg.seed);
+        const parsed = parseGenerateRequest(msg, terrain.width, terrain.height);
+        if (!parsed.ok) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: parsed.code,
+            message: parsed.message,
+            details: parsed.details,
+            requestId: parsed.requestId,
+          }));
+          return;
+        }
 
-        console.log(`Regenerating terrain ${width}x${height} seed=${seed ?? 'random'}`);
-        terrain = generateTerrain(width, height, seed);
+        const { width, height, seed, batloc } = parsed;
+
+        console.log(`Regenerating terrain ${width}x${height} seed=${seed ?? 'random'} batloc=${batloc.name}`);
+        const generated = generateTerrain(width, height, { seed, batloc });
+        const validation = validateTerrainData(generated);
+        if (!validation.valid) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: 'TERRAIN_INVARIANT_FAILED',
+            message: 'Terrain generation failed invariant checks',
+            details: validation.errors.map((e) => ({ field: e.invariant, reason: e.message })),
+            requestId: parsed.requestId,
+          }));
+          return;
+        }
+
+        terrain = generated;
+        console.log(`Terrain metrics: rivers=${validation.metrics.riverCount}, roads=${validation.metrics.roadCount}, bridges=${validation.metrics.bridgeCount}, objectives=${terrain.objectives.length}`);
         console.log(`New terrain: seaLevel=${terrain.seaLevel}, towns=${terrain.towns.length}`);
         ws.send(JSON.stringify({ type: 'terrain', data: terrain }));
       }

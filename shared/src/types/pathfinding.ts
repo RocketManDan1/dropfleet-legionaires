@@ -37,13 +37,6 @@ export interface UnitMovementState {
   stoppedForSec: number;      // seconds fully stationary
 }
 
-// --- Queued waypoint (max 4 per unit) ---
-
-export interface QueuedWaypoint {
-  pos: Vec2;
-  moveMode: MoveMode;
-}
-
 // --- Terrain cost table entry ---
 
 export interface TerrainCostEntry {

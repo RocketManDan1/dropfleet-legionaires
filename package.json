@@ -8,11 +8,11 @@
     "client"
   ],
   "scripts": {
-    "dev:server": "npm run dev -w server",
-    "dev:client": "npm run dev -w client",
-    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
-    "build:shared": "npm run build -w shared",
-    "build:server": "npm run build -w server",
-    "build:client": "npm run build -w client"
+    "dev:server": "pnpm --filter federation-legionaires-server dev",
+    "dev:client": "pnpm --filter federation-legionaires-client dev",
+    "build": "pnpm --filter @legionaires/shared build && pnpm --filter federation-legionaires-server build && pnpm --filter federation-legionaires-client build",
+    "build:shared": "pnpm --filter @legionaires/shared build",
+    "build:server": "pnpm --filter federation-legionaires-server build",
+    "build:client": "pnpm --filter federation-legionaires-client build"
   }
 }

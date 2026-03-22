@@ -70,7 +70,7 @@ export class RTSCamera {
     this.target.set(data.width / 2, 0, data.height / 2);
   }
 
-  private getTerrainHeight(worldX: number, worldZ: number): number {
+  getTerrainHeight(worldX: number, worldZ: number): number {
     if (!this.hmData) return 0;
 
     const x = Math.max(0, Math.min(this.hmWidth - 2, worldX));

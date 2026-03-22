@@ -364,15 +364,22 @@ export class UnitManager {
   // -------------------------------------------------------------------------
 
   /**
-   * Selects a single unit, deselecting all others.
+   * Selects a single unit. If addToSelection is false (default), deselects all others first.
    */
-  selectUnit(unitId: string): void {
-    this.deselectAll();
+  selectUnit(unitId: string, addToSelection: boolean = false): void {
+    if (!addToSelection) this.deselectAll();
     const unit = this.units.get(unitId);
     if (unit) {
       unit.isSelected = true;
       this.selectedIds.add(unitId);
     }
+  }
+
+  /**
+   * Returns all friendly ClientUnit records.
+   */
+  getAllUnits(): ClientUnit[] {
+    return Array.from(this.units.values());
   }
 
   /**
@@ -619,11 +626,40 @@ export class UnitManager {
   /**
    * Infers a UnitClass from the unit type ID.
    *
-   * TODO: Replace with a proper lookup from a UnitType registry that maps
-   *       unitTypeId -> UnitType.unitClass. For now, defaults to 'infantry'.
+   * Uses keyword matching on the unitTypeId string until the full CSV-backed
+   * UnitType registry is loaded in M2.
    */
-  private _inferUnitClass(_unitTypeId: string): UnitClass {
-    // TODO: Look up from loaded CSV / shared UnitType definitions
+  private _inferUnitClass(unitTypeId: string): UnitClass {
+    const id = unitTypeId.toUpperCase();
+
+    // Armour / vehicles
+    if (id.includes('ABRAMS') || id.includes('MBT') || id.includes('LEOPARD') || id.includes('T-') && id.match(/T-\d/)) return 'mbt';
+    if (id.includes('BRADLEY') || id.includes('IFV') || id.includes('BMP')) return 'ifv';
+    if (id.includes('APC') || id.includes('STRYKER') || id.includes('BTR')) return 'apc';
+    if (id.includes('SCOUT') || id.includes('RECON')) return 'scout';
+    if (id.includes('JAVELIN') || id.includes('TOW') || id.includes('AT_VEH')) return 'at_vehicle';
+    if (id.includes('AA_VEH') || id.includes('AVENGER') || id.includes('GEPARD')) return 'aa_vehicle';
+    if (id.includes('PALADIN') || id.includes('SPG') || id.includes('ARTY_SP')) return 'arty_sp';
+    if (id.includes('HOWITZER') || id.includes('ARTY_TOW')) return 'arty_towed';
+    if (id.includes('MORTAR')) return 'mortar';
+    if (id.includes('SUPPLY') || id.includes('LOGISTICS')) return 'supply';
+    if (id.includes('HQ') || id.includes('COMMAND')) return 'hq';
+
+    // Infantry
+    if (id.includes('SNIPER')) return 'sniper';
+    if (id.includes('ENGINEER') || id.includes('SAPPER')) return 'engineer';
+    if (id.includes('AT_INF') || id.includes('ANTI_TANK') || id.includes('ANTI-TANK')) return 'at_infantry';
+    if (id.includes('AA_INF') || id.includes('MANPAD') || id.includes('STINGER')) return 'aa_infantry';
+    if (id.includes('INFANTRY') || id.includes('RIFLE') || id.includes('SQUAD')) return 'infantry';
+
+    // Air
+    if (id.includes('APACHE') || id.includes('ATTACK_HELO') || id.includes('HELO_ATK')) return 'helicopter_attack';
+    if (id.includes('BLACKHAWK') || id.includes('TRANSPORT_HELO') || id.includes('HELO_TRN')) return 'helicopter_transport';
+    if (id.includes('FIXED_WING') || id.includes('F-') || id.includes('A-10')) return 'fixed_wing';
+
+    // Support catch-all
+    if (id.includes('SUPPORT')) return 'support';
+
     return 'infantry';
   }
 }

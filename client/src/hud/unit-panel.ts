@@ -29,7 +29,6 @@ const COLORS = {
   barBg: '#1A1A1A',
   morale: {
     normal: '#80FFD0',
-    shaken: '#D09020',
     pinned: '#E0A020',
     routing: '#E04030',
     surrendered: '#808080',
@@ -37,14 +36,13 @@ const COLORS = {
   firePosture: {
     hold_fire: '#D09020',
     return_fire: '#C8C8C8',
-    fire_at_will: '#E04030',
+    free_fire: '#E04030',
   } as Record<FirePosture, string>,
 } as const;
 
 /** Human-readable labels for morale states. */
 const MORALE_LABELS: Record<MoraleState, string> = {
   normal: 'STEADY',
-  shaken: 'SHAKEN',
   pinned: 'PINNED',
   routing: 'ROUTING',
   surrendered: 'SURRENDERED',
@@ -54,7 +52,7 @@ const MORALE_LABELS: Record<MoraleState, string> = {
 const FIRE_POSTURE_LABELS: Record<FirePosture, string> = {
   hold_fire: 'HOLD FIRE',
   return_fire: 'RETURN FIRE',
-  fire_at_will: 'FREE FIRE',
+  free_fire: 'FREE FIRE',
 };
 
 /** Human-readable labels for speed states. */

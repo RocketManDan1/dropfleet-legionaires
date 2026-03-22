@@ -1,4 +1,6 @@
 import { createNoise2D } from 'simplex-noise';
+import { getPreset, normalizeSeed, type BatLocParams } from './batloc.js';
+import { TerrainType } from './terrain-types.js';
 
 type NoiseFunction2D = (x: number, y: number) => number;
 
@@ -14,6 +16,41 @@ export interface TownAnchor {
   radius: number;
 }
 
+export interface RiverFeature {
+  path: Array<{ x: number; z: number }>;
+  width: 'stream' | 'river' | 'wide';
+}
+
+export interface RoadFeature {
+  path: Array<{ x: number; z: number }>;
+  type: 'primary' | 'secondary' | 'dirt' | 'track';
+}
+
+export interface BridgeFeature {
+  x: number;
+  z: number;
+  roadType: string;
+  maxWeightClass: number;
+}
+
+export interface PointFeature {
+  x: number;
+  z: number;
+}
+
+export interface SpawnZone {
+  side: 'attacker' | 'defender';
+  cells: Array<{ x: number; z: number }>;
+}
+
+export interface Objective {
+  id: string;
+  label: string;
+  x: number;
+  z: number;
+  type: 'bridge' | 'ford' | 'hilltop' | 'crossroads' | 'town' | 'industrial';
+}
+
 export interface TerrainData {
   width: number;
   height: number;
@@ -27,9 +64,22 @@ export interface TerrainData {
   mountainWeightMap: number[];
   hillWeightMap: number[];
   flatlandWeightMap: number[];
+  terrainTypeMap: number[];
   towns: TownAnchor[];
+  rivers: RiverFeature[];
+  roads: RoadFeature[];
+  bridges: BridgeFeature[];
+  fords: PointFeature[];
+  spawnZones: SpawnZone[];
+  objectives: Objective[];
+  batloc: BatLocParams;
   seaLevel: number;
-  biome: BiomeType;
+  biome: string;
+}
+
+export interface GenerateTerrainOptions {
+  seed?: number;
+  batloc?: BatLocParams;
 }
 
 // ── Biome parameter sets ────────────────────────────────────────────────────
@@ -456,15 +506,190 @@ function buildDerivedMaps(heightmap: number[], width: number, height: number): {
   };
 }
 
+function classifyTerrainTypes(
+  width: number,
+  height: number,
+  heightmap: number[],
+  slopeMap: number[],
+  wetnessMap: number[],
+  coverMap: number[],
+  seaLevel: number,
+  batloc: BatLocParams,
+  towns: TownAnchor[],
+): number[] {
+  const terrainTypeMap = new Array<number>(width * height).fill(TerrainType.Open);
+
+  for (let i = 0; i < terrainTypeMap.length; i++) {
+    const h = heightmap[i];
+    const s = slopeMap[i];
+    const w = wetnessMap[i];
+    const c = coverMap[i];
+
+    if (h <= seaLevel) {
+      terrainTypeMap[i] = TerrainType.Water;
+      continue;
+    }
+    if (h <= seaLevel + 0.012) {
+      terrainTypeMap[i] = TerrainType.ShallowWater;
+      continue;
+    }
+    if (s > 0.78) {
+      terrainTypeMap[i] = TerrainType.Rock;
+      continue;
+    }
+    if (batloc.arid && h <= seaLevel + 0.03) {
+      terrainTypeMap[i] = TerrainType.Sand;
+      continue;
+    }
+    if (w > 0.86) {
+      terrainTypeMap[i] = TerrainType.Marsh;
+      continue;
+    }
+    if (w > 0.76) {
+      terrainTypeMap[i] = TerrainType.Mud;
+      continue;
+    }
+    if (c > 0.82) {
+      terrainTypeMap[i] = batloc.treeLevel >= 8 ? TerrainType.Jungle : TerrainType.Forest;
+      continue;
+    }
+    if (batloc.roughLevel >= 4 && s > 0.45) {
+      terrainTypeMap[i] = TerrainType.Rough;
+      continue;
+    }
+    if (batloc.grassLevel >= 5 && c > 0.58) {
+      terrainTypeMap[i] = TerrainType.HighGrass;
+      continue;
+    }
+    if (batloc.fieldLevel >= 4 && c < 0.42 && w < 0.6) {
+      terrainTypeMap[i] = TerrainType.Fields;
+      continue;
+    }
+
+    terrainTypeMap[i] = TerrainType.Open;
+  }
+
+  // Stamp urban footprint from town anchors as a simple MVP classifier.
+  for (const town of towns) {
+    const minX = Math.max(0, Math.floor(town.x - town.radius));
+    const maxX = Math.min(width - 1, Math.ceil(town.x + town.radius));
+    const minZ = Math.max(0, Math.floor(town.z - town.radius));
+    const maxZ = Math.min(height - 1, Math.ceil(town.z + town.radius));
+
+    for (let z = minZ; z <= maxZ; z++) {
+      for (let x = minX; x <= maxX; x++) {
+        const dx = x - town.x;
+        const dz = z - town.z;
+        if ((dx * dx) + (dz * dz) > town.radius * town.radius) continue;
+        const idx = z * width + x;
+        if (terrainTypeMap[idx] === TerrainType.Water || terrainTypeMap[idx] === TerrainType.ShallowWater) continue;
+        terrainTypeMap[idx] = town.type === 'industrial' ? TerrainType.Industrial : TerrainType.Urban;
+      }
+    }
+  }
+
+  return terrainTypeMap;
+}
+
+function buildSpawnZones(width: number, height: number, terrainTypeMap: number[], seaLevel: number, heightmap: number[]): SpawnZone[] {
+  const attacker: SpawnZone = { side: 'attacker', cells: [] };
+  const defender: SpawnZone = { side: 'defender', cells: [] };
+
+  const band = Math.max(8, Math.floor(height * 0.12));
+  for (let z = 0; z < band; z++) {
+    for (let x = 0; x < width; x++) {
+      const idx = z * width + x;
+      if (heightmap[idx] <= seaLevel) continue;
+      if (terrainTypeMap[idx] === TerrainType.Water || terrainTypeMap[idx] === TerrainType.Rock) continue;
+      attacker.cells.push({ x, z });
+    }
+  }
+
+  for (let z = height - band; z < height; z++) {
+    for (let x = 0; x < width; x++) {
+      const idx = z * width + x;
+      if (heightmap[idx] <= seaLevel) continue;
+      if (terrainTypeMap[idx] === TerrainType.Water || terrainTypeMap[idx] === TerrainType.Rock) continue;
+      defender.cells.push({ x, z });
+    }
+  }
+
+  return [attacker, defender];
+}
+
+function buildObjectives(
+  width: number,
+  height: number,
+  towns: TownAnchor[],
+  bridges: BridgeFeature[],
+  fords: PointFeature[],
+  heightmap: number[],
+): Objective[] {
+  const out: Objective[] = [];
+
+  for (let i = 0; i < towns.length; i++) {
+    const t = towns[i];
+    out.push({
+      id: `obj-town-${i + 1}`,
+      label: t.type === 'industrial' ? 'Industrial Node' : 'Town Center',
+      x: t.x,
+      z: t.z,
+      type: t.type === 'industrial' ? 'industrial' : 'town',
+    });
+  }
+
+  for (let i = 0; i < bridges.length; i++) {
+    const b = bridges[i];
+    out.push({
+      id: `obj-bridge-${i + 1}`,
+      label: 'Bridge Crossing',
+      x: b.x,
+      z: b.z,
+      type: 'bridge',
+    });
+  }
+
+  for (let i = 0; i < fords.length; i++) {
+    const f = fords[i];
+    out.push({
+      id: `obj-ford-${i + 1}`,
+      label: 'Ford Crossing',
+      x: f.x,
+      z: f.z,
+      type: 'ford',
+    });
+  }
+
+  // Add one simple hilltop objective at the highest cell.
+  let maxIdx = 0;
+  for (let i = 1; i < heightmap.length; i++) {
+    if (heightmap[i] > heightmap[maxIdx]) maxIdx = i;
+  }
+  out.push({
+    id: 'obj-hilltop-1',
+    label: 'Hilltop',
+    x: maxIdx % width,
+    z: Math.floor(maxIdx / width),
+    type: 'hilltop',
+  });
+
+  return out;
+}
+
 // ── Generator ───────────────────────────────────────────────────────────────
 
 export function generateTerrain(
   width: number = 400,
   height: number = 400,
-  seed?: number,
+  seedOrOptions?: number | GenerateTerrainOptions,
 ): TerrainData {
-  const resolvedSeed = seed ?? Math.random();
-  const baseSeed = Math.floor(Math.abs(resolvedSeed) * 1_000_000) >>> 0;
+  const options: GenerateTerrainOptions = typeof seedOrOptions === 'number'
+    ? { seed: seedOrOptions }
+    : (seedOrOptions ?? {});
+
+  const batloc = options.batloc ?? getPreset('plains');
+  const resolvedSeed = options.seed ?? Math.random();
+  const baseSeed = normalizeSeed(resolvedSeed);
 
   // Three shared noise functions — same landmass shape across all biomes.
   // Use independent seeded PRNG streams to avoid permutation-table banding.
@@ -494,11 +719,14 @@ export function generateTerrain(
   const biomeScale1 = 0.0028;
   const biomeScale2 = 0.0035;
 
-  const seaLevel = (
+  let seaLevel = (
     BIOME_PARAMS.mountains.seaLevel +
     BIOME_PARAMS.hills.seaLevel +
     BIOME_PARAMS.flatlands.seaLevel
   ) / 3;
+
+  if (batloc.season === 'winter') seaLevel -= 0.01;
+  if (batloc.season === 'desert') seaLevel += 0.02;
 
   const heightmap: number[] = new Array(width * height);
   const mountainWeightMap: number[] = new Array(width * height);
@@ -567,6 +795,26 @@ export function generateTerrain(
     baseSeed,
   );
 
+  const terrainTypeMap = classifyTerrainTypes(
+    width,
+    height,
+    heightmap,
+    slopeMap,
+    wetnessMap,
+    coverMap,
+    seaLevel,
+    batloc,
+    towns,
+  );
+
+  // MVP scaffolding for feature graph layers. Later milestones fill these in.
+  const rivers: RiverFeature[] = [];
+  const roads: RoadFeature[] = [];
+  const bridges: BridgeFeature[] = [];
+  const fords: PointFeature[] = [];
+  const spawnZones = buildSpawnZones(width, height, terrainTypeMap, seaLevel, heightmap);
+  const objectives = buildObjectives(width, height, towns, bridges, fords, heightmap);
+
   return {
     width,
     height,
@@ -580,8 +828,16 @@ export function generateTerrain(
     mountainWeightMap,
     hillWeightMap,
     flatlandWeightMap,
+    terrainTypeMap,
     towns,
+    rivers,
+    roads,
+    bridges,
+    fords,
+    spawnZones,
+    objectives,
+    batloc,
     seaLevel,
-    biome: 'mixed',
+    biome: batloc.name,
   };
 }

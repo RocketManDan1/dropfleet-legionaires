@@ -383,13 +383,22 @@ export class ClientPathfinder {
    * @param scene - The Three.js scene to add the line to.
    * @param path - Array of world-space waypoints.
    * @param yOffset - Height offset above terrain (default 0.5).
+   * @param getTerrainHeight - Optional callback to sample terrain height at (x,z).
    */
-  showPathPreview(scene: THREE.Scene, path: Vec2[], yOffset: number = 0.5): void {
+  showPathPreview(
+    scene: THREE.Scene,
+    path: Vec2[],
+    yOffset: number = 0.5,
+    getTerrainHeight?: (x: number, z: number) => number,
+  ): void {
     this.clearPathPreview(scene);
 
     if (path.length < 2) return;
 
-    const points = path.map(p => new THREE.Vector3(p.x, yOffset, p.z));
+    const points = path.map(p => {
+      const y = getTerrainHeight ? getTerrainHeight(p.x, p.z) + yOffset : yOffset;
+      return new THREE.Vector3(p.x, y, p.z);
+    });
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
 
     this.previewLine = new THREE.Line(geometry, this.previewMaterial);

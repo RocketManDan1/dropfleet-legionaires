@@ -22,11 +22,11 @@ import {
 import type { GameSession } from './session.js';
 import { resolveMovement } from '../systems/movement.js';
 import { updateSpotting } from '../systems/spotting.js';
-import { resolveFire } from '../systems/fire.js';
+import { resolveFire, type FireOrder } from '../systems/fire.js';
 import { applyDamage } from '../systems/damage.js';
 import { updateSuppression } from '../systems/suppression.js';
 import { tickSupply } from '../systems/supply.js';
-import { broadcastState } from '../network/broadcast.js';
+import { broadcastGameState } from '../network/broadcast.js';
 
 // ---------------------------------------------------------------------------
 // Loop state enum — matches SERVER_GAME_LOOP.md §1
@@ -387,24 +387,29 @@ export class TickLoop {
     const contacts = this.session.getContactMap();
 
     // Gather pending fire orders from unit intents
-    const fireOrders: ResolvedOrder[] = [];
+    const fireOrders: FireOrder[] = [];
     for (const [id, unit] of units) {
       if (unit.isDestroyed) continue;
       if (
-        unit.currentOrder?.type === 'engage' ||
-        unit.currentOrder?.type === 'area_fire'
+        (unit.currentOrder?.type === 'engage' ||
+         unit.currentOrder?.type === 'area_fire') &&
+        unit.currentOrder.targetUnitId
       ) {
-        fireOrders.push(unit.currentOrder);
+        fireOrders.push({
+          unitId: id,
+          targetUnitId: unit.currentOrder.targetUnitId,
+          weaponSlot: unit.currentOrder.weaponSlot,
+        });
       }
     }
 
-    const shotRecords = resolveFire(units, contacts, fireOrders, dt);
+    const fireResult = resolveFire(units, contacts, fireOrders, dt);
 
     // Store shot records on the session for Phase 6
-    this.session.setPendingShotRecords(shotRecords);
+    this.session.setPendingShotRecords(fireResult.shotRecords);
 
     // Emit shot-fired events for the intra-tick bus
-    for (const shot of shotRecords) {
+    for (const shot of fireResult.shotRecords) {
       this.tickEvents.push({
         type: 'SHOT_FIRED',
         data: { firerId: shot.firerId, targetId: shot.targetId, weaponSlot: shot.weaponSlot },
@@ -421,10 +426,10 @@ export class TickLoop {
     if (shotRecords.length === 0) return;
 
     const units = this.session.getUnitRegistry();
-    const damageResults = applyDamage(shotRecords, units);
+    const damagePhaseResult = applyDamage(shotRecords, units, this.tick);
 
     // Emit destruction and impact events for Phase 7 (suppression)
-    for (const result of damageResults) {
+    for (const result of damagePhaseResult.damageResults) {
       this.tickEvents.push({
         type: 'SHOT_IMPACT',
         data: {
@@ -443,7 +448,7 @@ export class TickLoop {
     }
 
     // Store damage results on session for broadcast
-    this.session.setPendingDamageResults(damageResults);
+    this.session.setPendingDamageResults(damagePhaseResult.damageResults);
   }
 
   /**
@@ -454,10 +459,16 @@ export class TickLoop {
   private phaseSuppressionMorale(dt: number, isSecondTick: boolean): void {
     const units = this.session.getUnitRegistry();
 
-    // Collect impact events from this tick for suppression accumulation
-    const impacts = this.tickEvents.filter(
-      (e) => e.type === 'SHOT_IMPACT' || e.type === 'UNIT_DESTROYED'
-    );
+    // Collect impact events from this tick, convert to SuppressionImpact
+    const impacts = this.tickEvents
+      .filter((e) => e.type === 'SHOT_IMPACT')
+      .map((e) => ({
+        targetId: (e.data as { targetId: string }).targetId,
+        warheadSize: (e.data as { damage?: number }).damage ?? 1,
+        isDirectHit: true,
+        isNearMiss: false,
+        nearMissDistanceM: 0,
+      }));
 
     updateSuppression(units, impacts, dt, isSecondTick);
   }
@@ -478,6 +489,6 @@ export class TickLoop {
    * Compute delta from previous state, fog-filter per player, send over WS.
    */
   private phaseBroadcast(): void {
-    broadcastState(this.session, this.tickEvents, this.tick);
+    broadcastGameState(this.session, this.tickEvents, this.tick);
   }
 }

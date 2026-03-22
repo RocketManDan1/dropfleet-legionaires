@@ -708,6 +708,7 @@ export function createTerrainMesh(data: TerrainData): THREE.Group {
     side: THREE.FrontSide,
   });
   const terrainMesh = new THREE.Mesh(geometry, terrainMaterial);
+  terrainMesh.name = 'terrain-surface';
   terrainMesh.position.set(centerX, 0, centerZ);
   group.add(terrainMesh);
 
