@@ -306,13 +306,20 @@ interface AmmoState {
 
 ## EW Value Reference (non-AA vehicles)
 
-| EW value | System | Charges |
-|---|---|---|
-| 0 | None | — |
-| 1 | Arena (intercepts ATGMs) | 1 |
-| 2 | Arena | 2 |
-| 3 | VIRSS (anti-TI smoke + IR jammer) | 1 |
-| 4 | VIRSS | 2 |
+| EW value | System | Charges | Activation trigger | Effect |
+|---|---|---|---|---|
+| 0 | None | — | — | — |
+| 1 | Arena (intercepts ATGMs) | 1 | Auto, per incoming HEAT/ATGM round | Consumes 1 charge; intercepts the round before penetration roll |
+| 2 | Arena | 2 | Auto, per incoming HEAT/ATGM round | Same as above; 2 charges total |
+| 3 | VIRSS (anti-TI smoke + IR jammer) | 1 | Auto, when unit is targeted by thermal sensor | Consumes 1 charge; ejects screening smoke (45 s, 30 m radius); thermal detection range × 0.50 for duration |
+| 4 | VIRSS | 2 | Auto, when unit is targeted by thermal sensor | Same as above; 2 charges total |
+
+**Charge rules:**
+- `ewCharges` is initialised from `UnitType.ew` at mission start (value = charge count above).
+- Charges are consumed automatically by the server — no player order required.
+- Arena activates once per incoming HEAT/ATGM round (one charge per intercept attempt).
+- VIRSS activates at most once per targeting event; consecutive targeting within the smoke cloud does not consume additional charges.
+- `ewCharges` is not resupplied between missions (charges reset to full at next mission start).
 
 ---
 

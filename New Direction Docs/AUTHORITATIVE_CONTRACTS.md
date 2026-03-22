@@ -42,6 +42,44 @@ Numeric `difficultyRating` is not part of mission runtime/persistence contracts.
 
 ---
 
+## 1a. SP Economy
+
+Canonical source: **POST_MISSION_RESOLUTION.md §1**.
+
+### 1a.1 Formula
+
+```
+base_sp   = MISSION_TYPE_SP[missionType][outcome]
+scaled_sp = floor(base_sp × DIFFICULTY_MULTIPLIERS[difficultyTier])
+bonus_sp  = (zeroKIA ? 100 : 0) + (secondaryObjectivesCompleted × 150) + (underHalfTime ? 50 : 0)
+total_sp  = scaled_sp + bonus_sp
+final_sp  = max(floor(total_sp × participationPct), 10)
+```
+
+### 1a.2 Difficulty Multipliers
+
+| Tier | Multiplier |
+|------|-----------|
+| easy | × 1.0 |
+| medium | × 1.5 |
+| hard | × 2.0 |
+
+### 1a.3 Outcome Factors
+
+| Outcome | Factor |
+|---------|--------|
+| VICTORY | 1.0 (full) |
+| DRAW | 0.5 |
+| DEFEAT | — (no multiplier; DEFEAT base is a separate, lower value per mission type) |
+
+### 1a.4 SP Floor
+
+No player receives fewer than **10 SP** for any participation.
+
+Do NOT define `spRewardRange` or other flat SP fields in mission lifecycle or generation code. They conflict with this model.
+
+---
+
 ## 2. Mission Phases and Wire Mapping
 
 ### 2.1 Internal lifecycle phases
@@ -255,6 +293,21 @@ Full block: terrain ridge, Urban, Industrial. Partial: woodland, smoke.
 
 LOS/spotting runs once per second (every 20 ticks), not every tick.
 
+### 9.7a ContactSnapshot Wire Fields
+
+The `tier` field on `ContactSnapshot` (NETWORK_PROTOCOL.md) is the **raw detection accumulator value**, an integer in the range 0–100. It is NOT a 0–3 tier index.
+
+`tierLabel` is the derived human-readable enum and is computed server-side from `tier`:
+
+| `tier` range | `tierLabel` |
+|---|---|
+| 1–24 | `'SUSPECTED'` |
+| 25–74 | `'DETECTED'` |
+| 75–100 | `'CONFIRMED'` |
+| 0 (post-acquisition) | contact enters LOST; `tierLabel` absent |
+
+Use `tierLabel` for fire-permission checks and UI display. Use `tier` for fine-grained display (e.g., "how close to next detection upgrade").
+
 ### 9.8 Performance Caps
 
 | Metric | Limit |
@@ -272,6 +325,27 @@ LOS/spotting runs once per second (every 20 ticks), not every tick.
 ### 10.1 Architecture
 
 3-layer: Strategic (Utility + Influence Maps, every 5 s) → Platoon (Behavior Trees, every 1–2 s) → Unit (existing fire posture, every tick).
+
+### 10.1a Canonical Platoon Sizes
+
+Enemy force sizing uses `enemyPlatoonRange` (MISSION_GENERATION.md) as the authoritative unit count method. Platoon sizes by faction and unit type:
+
+| Faction | Infantry platoon | Vehicle platoon | Specialist platoon |
+|---------|-----------------|-----------------|-------------------|
+| Ataxian Hive | 6 units | 4 units | 3 units |
+| Khroshi Syndicalists | 4 units | 3 units | 2 units |
+
+*Ataxian platoons are larger — swarm archetype. Khroshi platoons are smaller but higher-quality and better-equipped.*
+
+**Approximate unit totals by difficulty** (mixed-composition force):
+
+| Difficulty | Platoon range | Approx unit range |
+|------------|--------------|-------------------|
+| Easy | 2–3 platoons | ~12–20 units |
+| Medium | 4–6 platoons | ~24–40 units |
+| Hard | 7–10 platoons | ~40–65 units |
+
+These ranges are design targets; exact counts vary by faction and mission type. Raw unit counts (`enemyCountRange`) are deprecated — derive unit count from platoon count × platoon size.
 
 ### 10.2 Canonical Types
 
@@ -305,6 +379,18 @@ AI decisions inject at start of **Phase 2 (Command Propagation)**, before player
 | Influence map update (every 5 s) | ≤ 0.6 ms |
 | All platoon BT evals per second | ≤ 0.5 ms |
 | Total amortised AI per tick | ≤ 0.13 ms |
+
+### 10.6a C2 Fallback Radio Range
+
+When a Khroshi Broadcast Node is destroyed, Khroshi units fall back to point-to-point radio contact sharing. The fallback range is:
+
+```typescript
+const C2_FALLBACK_RADIO_RANGE_M = 300;
+```
+
+Units within 300 m of each other continue to share contact data. Units beyond 300 m operate with independent accumulators.
+
+Ataxian units do not use radio fallback — their pheromone network is anchored to the Synaptic Brood. Without a Brood, Ataxian units beyond 300 m of any surviving Brood unit fight independently.
 
 ### 10.7 Fog of War
 
@@ -363,7 +449,7 @@ normal alpha blending for mass (smoke, dust, debris).
 
 | Metric | Limit |
 |--------|-------|
-| Max concurrent particles | 512 |
+| Max concurrent particles | 560 |
 | Particle pools (draw calls) | 17 |
 | Max ground decals | 64 |
 | Total VFX per frame | ≤ 0.85 ms |

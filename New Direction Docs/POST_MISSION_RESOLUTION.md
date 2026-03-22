@@ -181,6 +181,21 @@ Where:
 | **DEFEAT** | No influence change from this mission. Enemy influence ticks up passively per campaign tick rules (CAMPAIGN_OVERVIEW.md) |
 | **DRAW** | Enemy influence reduced by 50% of victory amount |
 
+### Influence Redistribution Rule
+
+The three factions always sum to 100 (`federation + ataxian + khroshi = 100`). When a mission reduces enemy influence, **all freed influence points go directly to the Federation**. There is no proportional split — a win expands Terran control directly.
+
+Example: planet is 40% Federation / 35% Ataxian / 25% Khroshi. A VICTORY reduces Ataxian influence by 10 → result is 50% Federation / 25% Ataxian / 25% Khroshi. Khroshi is unaffected by this mission.
+
+```typescript
+function applyInfluenceReduction(planet: PlanetRecord, faction: FactionId, reduction: number): void {
+  const clamped = Math.min(reduction, planet[`influence_${faction}`]);
+  planet[`influence_${faction}`] -= clamped;
+  planet.influence_federation    += clamped;   // freed points always go to Federation
+  // Sum remains 100.
+}
+```
+
 ### Influence Delta Interface
 
 ```typescript

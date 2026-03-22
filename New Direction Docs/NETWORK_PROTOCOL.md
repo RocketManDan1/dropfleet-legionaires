@@ -398,9 +398,13 @@ interface ActiveOrderInfo {
 
 interface ContactSnapshot {
   contactId:    string;
-  tier:         number;           // 0-100 detection confidence
+  tier:         number;           // raw detection accumulator, integer 0–100
+                                  // (NOT a 0–3 index; mirrors the server accumulator value)
+                                  // 1–24 = SUSPECTED, 25–74 = DETECTED, 75–100 = CONFIRMED
   tierLabel:    'SUSPECTED' | 'DETECTED' | 'CONFIRMED';
-  posX:         number;           // approximate or exact depending on tier
+                                  // derived from tier; use tierLabel for display/logic,
+                                  // tier for precision (e.g. how close to next upgrade)
+  posX:         number;           // approximate (±50m jitter) at SUSPECTED, exact at DETECTED+
   posZ:         number;
   unitClass?:   string;           // known if DETECTED+
   heading?:     number;           // known if CONFIRMED

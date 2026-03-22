@@ -9,6 +9,7 @@
     "lint:docs:contracts": "node scripts/lint-doc-contracts.mjs"
   },
   "dependencies": {
+    "@legionaires/shared": "workspace:*",
     "ws": "^8.16.0",
     "simplex-noise": "^4.0.1"
   },

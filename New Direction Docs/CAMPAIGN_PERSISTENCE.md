@@ -314,13 +314,15 @@ interface PlanetState {
 
 | Influence Range | State | Mission Availability |
 |---|---|---|
-| 0-20% enemy | Secure | No missions, no enemy activity |
-| 21-50% enemy | Contested | Standard mission pool |
-| 51-80% enemy | Falling | High-priority missions, increased enemy reinforcement rate |
-| 81-99% enemy | Critical | Emergency missions only, max enemy density |
+| 0% enemy | Secure | No missions — "This planet is secure." All difficulty buttons disabled. |
+| 1–50% enemy | Contested | Standard mission pool |
+| 51–80% enemy | Falling | High-priority missions, increased enemy reinforcement rate |
+| 81–99% enemy | Critical | Emergency missions only, max enemy density |
 | 100% enemy | Fallen | Planet locked, spreads influence to neighbors |
 
 Influence is per-enemy-faction. A planet can be simultaneously 30% Ataxian and 25% Khroshi (with 45% Federation). The `controllingFaction` is whichever single faction exceeds 50%. If none do, `controllingFaction` is null (contested).
+
+**Redistribution rule:** The `CHECK (sum = 100)` constraint is always satisfied by routing freed influence to the Federation. When a mission reduces enemy influence, `influence_federation` increases by the same amount. No other faction receives the freed points. See POST_MISSION_RESOLUTION.md §Influence Redistribution Rule for the implementation.
 
 ### SQL Schema
 
@@ -766,8 +768,21 @@ The campaign continues while players are offline. The server ticks forward regar
 
 ```
 FOR each planet:
-  IF no Federation players present AND enemy influence < 100%:
-    Increase enemy influence by tick_rate (scaled by adjacent fallen planets)
+  IF no Federation players present AND total enemy influence < 100%:
+
+    // Determine which faction grows this tick.
+    // If only one enemy faction has presence: that faction grows.
+    // If both Ataxian and Khroshi have influence > 0%:
+    //   They alternate each campaign tick — Ataxian on odd ticks, Khroshi on even ticks.
+    //   Each faction competes for territory; only the active faction's influence increases.
+    //   The other holds steady (neither grows nor shrinks from this rule alone).
+    //   Both factions remain bound by the redistribution rule:
+    //   gained influence comes from Federation's share (influence_federation decreases).
+
+    growing_faction = determine_growing_faction(planet, campaign_tick_number)
+    Increase growing_faction influence by tick_rate (scaled by adjacent fallen planets)
+    Decrease influence_federation by same amount
+
   IF enemy influence reaches 100%:
     Mark planet as Fallen
     Log campaign event: planet_fallen
@@ -790,6 +805,26 @@ Run faction AI strategy evaluation:
   Khroshi: evaluate fortification priorities
   Update expansion_pressure based on current holdings
 ```
+
+### Multi-Faction Offline Growth Rule
+
+When both Ataxian and Khroshi influence are present on a planet (both > 0%), the factions compete for the Federation's remaining share. They alternate each campaign tick:
+
+```typescript
+function determineGrowingFaction(planet: PlanetRecord, campaignTickNumber: number): FactionId | null {
+  const hasAtaxian  = planet.influence_ataxian  > 0;
+  const hasKhroshi  = planet.influence_khroshi  > 0;
+
+  if (!hasAtaxian && !hasKhroshi) return null;  // no enemy present
+  if ( hasAtaxian && !hasKhroshi) return 'ataxian';
+  if (!hasAtaxian &&  hasKhroshi) return 'khroshi';
+
+  // Both factions present: alternate by tick parity
+  return campaignTickNumber % 2 === 1 ? 'ataxian' : 'khroshi';
+}
+```
+
+**Design intent:** The two enemy factions are not allies. They compete for the same space. When both are on the same planet, neither is making steady progress — they're splitting their pressure against the Federation. A planet contested between all three factions falls more slowly than one being pushed by a single enemy.
 
 ### What Does NOT Happen Offline
 

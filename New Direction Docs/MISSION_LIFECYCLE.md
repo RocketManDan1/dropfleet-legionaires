@@ -95,19 +95,21 @@ interface DifficultyProfile {
   difficulty:       MissionDifficulty;
   tunedForPlayers:  number;       // 1, 2, or 3
   maxPlayers:       number;       // always 4
-  enemyCountRange:  [number, number]; // min-max enemy units (fixed at creation)
+  // Enemy force is sized in platoons — see MISSION_GENERATION.md DIFFICULTY_PROFILES.
+  // Approximate unit equivalents: easy ≈ 15–25 units, medium ≈ 30–50, hard ≈ 50–80.
   timeLimitMin:     number;       // real-time minutes
-  spRewardRange:    [number, number]; // victory SP range
+  // SP rewards use the mission-type × difficulty model — see POST_MISSION_RESOLUTION.md §1.
+  // Do NOT add a flat spRewardRange here; that model is superseded.
 }
 
 const DIFFICULTY_PROFILES: Record<MissionDifficulty, DifficultyProfile> = {
-  easy:   { difficulty: 'easy',   tunedForPlayers: 1, maxPlayers: 4, enemyCountRange: [15, 25],  timeLimitMin: 30, spRewardRange: [200, 300] },
-  medium: { difficulty: 'medium', tunedForPlayers: 2, maxPlayers: 4, enemyCountRange: [30, 50],  timeLimitMin: 45, spRewardRange: [300, 400] },
-  hard:   { difficulty: 'hard',   tunedForPlayers: 3, maxPlayers: 4, enemyCountRange: [50, 80],  timeLimitMin: 60, spRewardRange: [400, 500] },
+  easy:   { difficulty: 'easy',   tunedForPlayers: 1, maxPlayers: 4, timeLimitMin: 30 },
+  medium: { difficulty: 'medium', tunedForPlayers: 2, maxPlayers: 4, timeLimitMin: 45 },
+  hard:   { difficulty: 'hard',   tunedForPlayers: 3, maxPlayers: 4, timeLimitMin: 60 },
 };
 ```
 
-**Enemy count does NOT scale with player count.** A hard mission spawns 50-80 enemies whether one player joins or four. Difficulty was locked at creation. More players means more firepower, not more enemies.
+**Enemy count does NOT scale with player count.** A hard mission spawns the same enemy force whether one player joins or four. Difficulty was locked at creation. More players means more firepower, not more enemies. See AUTHORITATIVE_CONTRACTS.md §10.1a for canonical platoon sizes and approximate unit totals by difficulty.
 
 ---
 
@@ -454,25 +456,24 @@ interface PlayerAARResult {
 
 ### SP Calculation
 
+Canonical formula is defined in **POST_MISSION_RESOLUTION.md §1** (mission-type SP table × difficulty multiplier + bonuses). Summary:
+
 ```
-Base SP = difficulty reward range (see DIFFICULTY_PROFILES)
-  - VICTORY: full range (200-500 depending on difficulty)
-  - DEFEAT:  failure tier (50-100)
-  - DRAW:    50% of victory range
+base_sp   = MISSION_TYPE_SP[missionType][outcome]      // e.g. patrol VICTORY = 200, breakthrough VICTORY = 500
+scaled_sp = floor(base_sp × DIFFICULTY_MULTIPLIERS[tier])  // easy×1.0, medium×1.5, hard×2.0
+bonus_sp  = (zeroKIA ? 100 : 0)
+          + (secondaryObjectivesCompleted × 150)
+          + (underHalfTime ? 50 : 0)
+total_sp  = scaled_sp + bonus_sp
 
-Bonuses (applied only on VICTORY or DRAW):
-  + 100 SP if zero friendly KIA (this player's units only)
-  + 150 SP per secondary objective completed
-  + 50 SP if completed under half the time limit
-
-Participation scaling:
-  Final SP = (Base + Bonuses) * participationPct
+Participation scaling (for late joiners and early disconnects):
+  final_sp = max(floor(total_sp × participationPct), 10)   // 10 SP floor
 
   participationPct = activeTicks / totalMissionTicks
     where activeTicks = ticks the player was connected and had units on field
 ```
 
-A player who joins at the halfway mark of a victorious hard mission and takes no casualties earns roughly: `(450 + 100) * 0.50 = 275 SP`. Fair reward for showing up, but less than someone who fought the whole battle.
+A player who joins at the halfway mark of a victorious hard breakthrough and takes no casualties earns roughly: `floor(500 × 2.0 + 100) × 0.50 = 550 SP`. Fair reward for showing up, but less than someone who fought the whole battle.
 
 ### Free Camera
 

@@ -112,6 +112,27 @@ When a player issues a **CALL AIR** order, they select a strike type from their 
 - **AA threat**: If enemy AA units are active near the strike path, Fighter-Bomber and Level Bomber strikes have a chance of being **intercepted** — reduced effectiveness or aborted entirely. SEAD first, then strike.
 - **Attack Helicopter** is a physical unit that enters the map edge. It can be shot down. Lost helicopters do not cost the player anything (they are theater assets, not battalion assets) but the strike point is spent regardless.
 
+#### AA Interception Resolution
+
+AA interception is evaluated once when the strike delay timer completes (just before impact).
+
+- Eligible strike types: **Fighter-Bomber** and **Level Bomber** only.
+- Eligible defenders: enemy units with `unitClass: 'aa'` and `status: 'active'`.
+- Range gate: AA unit must be within **500m** of the strike path midpoint.
+- Base chance: **30%** if at least one eligible AA unit is in range.
+- Stacking: `+10%` per additional eligible AA (cap 3 contributors total).
+- SEAD suppression modifier: if the target AA unit was hit by SEAD in the last 60s, it contributes 0%.
+- Final clamp: interception chance is clamped to **[0%, 50%]**.
+
+Outcome on successful interception:
+
+- Fighter-Bomber: strike is degraded (damage and suppression multiplied by 0.5).
+- Level Bomber: strike is aborted (no damage applied).
+
+Outcome on failed interception:
+
+- Strike resolves normally.
+
 ---
 
 ## Fire Mission Types (CALL ARTY)

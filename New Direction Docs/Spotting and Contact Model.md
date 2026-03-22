@@ -341,7 +341,20 @@ concealmentMod = 1 - (6 - target.size) * 0.05;
 // size 0 (sniper/SF):     0.7x  — 30% slower, plus inherent hard-to-spot bonus
 ```
 
-Size 0 units also have a floor: they cannot be detected above SUSPECTED tier by any observer with `visionM < 750m` unless they fire.
+Size 0 units also have a detection cap: they cannot be detected above SUSPECTED tier (accumulator ≤ 24) by any observer with `visionM < 750m` unless they fire.
+
+This cap is enforced as a **post-accumulation clamp** applied after each spotting update:
+
+```typescript
+// After updating the accumulator for this observer/target pair:
+if (target.type.size === 0
+    && observer.type.visionM < 750
+    && !target.firedThisTick) {
+  accumulator = Math.min(accumulator, 24);  // hard cap at max SUSPECTED
+}
+```
+
+`firedThisTick` is set to `true` at the start of Phase 5 (Fire Resolution) for any unit that fires, and cleared to `false` at the start of Phase 4 (Spotting Updates) on the following second. A size-0 unit that fires can be detected to CONFIRMED tier normally for the remainder of that second.
 
 ---
 

@@ -45,7 +45,7 @@ The zone's position on the map depends on the mission type. The server selects t
 | **Seize** | Friendly map edge, facing the objective | Wide rectangle along the edge, 200–400m deep |
 | **Raid** | Infiltration point (flank or designated LZ) | Compact cluster near cover, away from enemy concentration |
 | **Patrol** | Friendly map edge, centered | Wide arc along the edge |
-| **Meeting Engagement** | One side of the map, 500m from center line | Broad frontage, moderate depth |
+| **Logistics** | Friendly map edge near route entry/exit corridor | Broad frontage, moderate depth |
 
 ```
 DEFEND — zone wraps around objective
@@ -406,7 +406,7 @@ AUTO-DEPLOY(unplacedUnits[], zone, alreadyPlacedUnits[])
   │   │
   │   └── 3c. Set facing:
   │          - Toward primary objective (defend/seize missions)
-  │          - Toward map center (patrol/meeting engagement)
+  │          - Toward map center (patrol/logistics)
   │
   ├── 4. Units that cannot be placed (zone full, all valid cells taken):
   │      → Added to ad-hoc reserve pool

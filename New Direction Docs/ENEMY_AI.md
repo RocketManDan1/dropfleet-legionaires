@@ -666,7 +666,7 @@ AI units share contacts through the same C2 system as players:
 - **Ataxian**: Units within 300m of a Synaptic Brood share contacts instantly
   (pheromone network). Units outside this range have independent accumulators.
 - **Khroshi**: Broadcast Node provides instant sharing within aura radius.
-  Without a Node, units share contacts at standard C2 radio range.
+  Without a Node, units share contacts at standard C2 radio range (300 m).
 
 If the command unit is destroyed, information sharing degrades — isolated
 platoons fight with only their own sensor data.

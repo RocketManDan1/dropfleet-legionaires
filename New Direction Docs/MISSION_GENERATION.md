@@ -140,9 +140,11 @@ const DIFFICULTY_PROFILES: Record<DifficultyTier, DifficultyProfile> = {
 
 | Impact | Base Influence Reduction | Strategic Value Bonus |
 |---|---|---|
-| Small | 3–5 points | +1 if strategic_value_tier = 1 |
-| Medium | 6–10 points | +2 if strategic_value_tier = 1 |
-| Large | 11–18 points | +3 if strategic_value_tier = 1 |
+| Small | 3–5 points | +1 if strategic_value_tier = 3 |
+| Medium | 6–10 points | +2 if strategic_value_tier = 3 |
+| Large | 11–18 points | +3 if strategic_value_tier = 3 |
+
+*Tier 3 = highest strategic value. Higher-value planets yield greater influence impact on victory.*
 
 ---
 

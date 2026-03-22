@@ -30,7 +30,7 @@ not photographed.
    command display, not cinematic renderings. Sharp edges, additive glow,
    fast fade. Think radar scope artifacts, not Michael Bay.
 
-4. **Performance ceiling.** Max 512 concurrent particles across all effects.
+4. **Performance ceiling.** Max 560 concurrent particles across all effects.
    Total GPU time for effects ≤ 0.5 ms/frame. Total CPU update ≤ 0.3 ms/frame.
 
 ---
@@ -1093,7 +1093,7 @@ debris cubes and a denser dust cloud (`#808080`).
 
 | Component | Budget | Notes |
 |-----------|--------|-------|
-| Particle update (CPU) | ≤ 0.3 ms | 512 particles, simple lerp + gravity |
+| Particle update (CPU) | ≤ 0.3 ms | 560 particles, simple lerp + gravity |
 | Instance matrix upload | ≤ 0.1 ms | One `needsUpdate` per pool |
 | Particle draw calls | ≤ 0.3 ms GPU | 1 draw call per pool (instanced) |
 | Ground decals | ≤ 0.1 ms GPU | 64 flat quads, depth-biased |
@@ -1241,8 +1241,8 @@ interface ScreenShake {
    DRONECOM philosophy: everything is computed.
 
 2. **Instanced over individual.** Each particle type is one `InstancedMesh`
-   with one draw call. 512 particles across 17 pools = 17 draw calls total.
-   A naive approach (one mesh per particle) would be 512 draw calls — an
+  with one draw call. 560 particles across 17 pools = 17 draw calls total.
+  A naive approach (one mesh per particle) would be 560 draw calls — an
    order of magnitude more expensive.
 
 3. **Additive blending for energy, normal for mass.** Fire, tracers, and

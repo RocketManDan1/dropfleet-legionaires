@@ -220,8 +220,17 @@ interface UnitInstance {
 
   // ── Supply ──────────────────────────────────────────────────────────────────
   /**
-   * EW system charges remaining (Arena / VIRSS). Decremented on activation.
-   * Initialised from UnitType.ew (see EW Value Reference table).
+   * EW system charges remaining (Arena / VIRSS). Decremented automatically
+   * by the server on each activation — no player order required.
+   *
+   * Initialised from UnitType.ew:
+   *   ew 0 → 0 charges (no system)
+   *   ew 1 → 1 charge  (Arena: intercepts one incoming HEAT/ATGM round)
+   *   ew 2 → 2 charges (Arena: two intercept attempts)
+   *   ew 3 → 1 charge  (VIRSS: anti-thermal smoke, activated when targeted by thermal)
+   *   ew 4 → 2 charges (VIRSS: two activations)
+   *
+   * See Unit Schema Spec.md §EW Value Reference for full activation rules.
    */
   ewCharges:        number;
   /** Smoke discharger salvos remaining. Decremented on DEPLOY SMOKE. */

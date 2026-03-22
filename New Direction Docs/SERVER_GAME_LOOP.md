@@ -34,6 +34,18 @@ TICK N (50ms budget)
   │   Read:  fire orders, contact tiers (DETECTED gate), weapon cooldowns, ammo counts
   │   Write: shot records, cooldown timers, ammo decrements, projectile-in-flight list
   │
+  │   Sub-phase ordering (within Phase 5):
+  │     5a. Auto-fire checks — units in FREE_FIRE posture that have a valid target in
+  │         their sensor arc fire autonomously. Cooldowns are applied immediately.
+  │     5b. Player ENGAGE orders — explicit fire orders from players are resolved.
+  │         If a unit already fired via auto-fire (5a), its weapon is on cooldown and
+  │         the ENGAGE order is rejected (ERR_WEAPON_COOLDOWN). A unit cannot fire
+  │         twice in the same tick regardless of source.
+  │
+  │   Rationale: auto-fire represents a unit's standing engagement behaviour;
+  │   player ENGAGE overrides only apply when the unit hasn't already acted.
+  │   Units in RETURN_FIRE or HOLD_FIRE postures skip step 5a entirely.
+  │
   ├─ Phase 6: Damage Application
   │   Read:  shot records, armour values, penetration tables, ERA state
   │   Write: unit HP, crew count, system damage flags, ERA charges, destroyed flag
@@ -156,7 +168,8 @@ type OrderRejectReason =
   | 'ERR_TRANSPORT_MOVING'      // dismount while transport is fast
   | 'ERR_ORDER_ILLEGAL'         // catch-all: order type not valid for this unit class
   | 'ERR_QUEUE_FULL'            // waypoint queue at max depth (4)
-  | 'ERR_C2_OUT_OF_RANGE';      // rally target beyond radio/voice range after roll
+  | 'ERR_C2_OUT_OF_RANGE'       // rally target beyond radio/voice range after roll
+  | 'ERR_WEAPON_COOLDOWN';      // weapon already fired this tick (e.g. auto-fire beat the order)
 ```
 
 ### Anti-Cheat: Fog of War Enforcement

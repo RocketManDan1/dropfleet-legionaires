@@ -107,7 +107,7 @@ Eleven screens. Each has a unique purpose. No screen duplicates another's functi
 | `SECTOR_MAP` | `PLANET_VIEW` | Click planet node | Fleet at that system |
 | `SECTOR_MAP` | `OOB_MANAGEMENT` | "Order of Battle" button | Always |
 | `PLANET_VIEW` | `SECTOR_MAP` | Back / Escape | Always |
-| `PLANET_VIEW` | `LOADING` | Select difficulty + confirm | Planet contested (21–99%) |
+| `PLANET_VIEW` | `LOADING` | Select difficulty + confirm | Planet contested (1–99%) |
 | `LOADING` | `DEPLOYMENT` | Mission generated | Server sends zone data |
 | `DEPLOYMENT` | `TACTICAL` | All ready or timer expires | Deployment ends |
 | `TACTICAL` | `AAR` | Mission ends | Any cause |
@@ -188,7 +188,7 @@ Eleven screens. Each has a unique purpose. No screen duplicates another's functi
 
 **Player Actions:** Select difficulty → launch/join mission. Join active mission. Back to sector map.
 
-**Blocking States:** Planet Secure (0–20% enemy) = no missions. Planet Fallen (100%) = only BREAKTHROUGH/EVACUATION.
+**Blocking States:** Planet Secure (0% enemy) = no missions. Planet Fallen (100%) = only BREAKTHROUGH/EVACUATION.
 
 ---
 
