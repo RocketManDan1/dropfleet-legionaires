@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Federation Legionaires</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      overflow: hidden;
+      font-family: 'Courier New', monospace;
+      color: #00ff88;
+    }
+    canvas { display: block; }
+    #status {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      font-size: 12px;
+      color: #00ff88;
+      opacity: 0.8;
+      pointer-events: none;
+      text-shadow: 0 0 4px #00ff8866;
+    }
+    #status.disconnected { color: #ff4444; }
+  </style>
+</head>
+<body>
+  <div id="status">CONNECTING...</div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
