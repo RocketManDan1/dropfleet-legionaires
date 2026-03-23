@@ -18,17 +18,22 @@ import type {
   DamageResult,
   Vec2,
   ResolvedOrder,
+  CostGrid,
+  MoveClass,
 } from '@legionaires/shared';
 import {
   DISCONNECT_GRACE_SEC,
   DISCONNECT_GRACE_TICKS,
   TICKS_PER_SEC,
   SNAPSHOT_INTERVAL_TICKS,
+  IMPASSABLE_THRESHOLD,
 } from '@legionaires/shared';
 
 import { TickLoop, type LoopState } from './tick-loop.js';
 import { SpatialHash } from './spatial-hash.js';
 import type { UnitRegistry } from '../data/unit-registry.js';
+import type { TerrainData } from '../terrain.js';
+import { TerrainType, TERRAIN_MOVE_COST } from '../terrain-types.js';
 
 // ---------------------------------------------------------------------------
 // Player connection wrapper — holds the WebSocket and order buffer
@@ -85,15 +90,8 @@ export function createPlayerConnection(
 // Terrain placeholder — will be expanded when the terrain system is built
 // ---------------------------------------------------------------------------
 
-export interface TerrainData {
-  /** Map width in metres. */
-  widthM: number;
-  /** Map height (depth) in metres. */
-  heightM: number;
-
-  // TODO: Add heightmap (Float32Array), terrain type grid (Uint8Array),
-  //       cover map, LOS raycaster, etc.
-}
+// TerrainData is imported from ../terrain.js — re-export for consumers
+export type { TerrainData } from '../terrain.js';
 
 // ---------------------------------------------------------------------------
 // Scenario settings — per-mission configuration
@@ -140,6 +138,7 @@ export class GameSession {
   private spatialHash: SpatialHash;
   private terrain: TerrainData;
   private scenario: ScenarioSettings;
+  private unitTypes: UnitRegistry | null;
 
   // --- Unit state -----------------------------------------------------------
   private unitRegistry: Map<string, UnitInstance> = new Map();
@@ -176,6 +175,9 @@ export class GameSession {
   private pendingShotRecords: ShotRecord[] = [];
   private pendingDamageResults: DamageResult[] = [];
 
+  // --- Cost grids (one per MoveClass, built at session creation) ------------
+  private costGrids: Map<MoveClass, CostGrid> = new Map();
+
   // --- Lifecycle timestamps -------------------------------------------------
   readonly createdAt: number;
   private missionStartTick: number = 0;
@@ -188,17 +190,65 @@ export class GameSession {
     sessionId: string,
     terrain: TerrainData,
     scenario: ScenarioSettings,
+    unitTypes: UnitRegistry | null = null,
   ) {
     this.sessionId = sessionId;
     this.terrain = terrain;
     this.scenario = scenario;
+    this.unitTypes = unitTypes;
     this.createdAt = Date.now();
 
     // Initialize spatial hash with map dimensions
-    this.spatialHash = new SpatialHash(terrain.widthM, terrain.heightM);
+    this.spatialHash = new SpatialHash(terrain.width, terrain.height);
+
+    // Build cost grids (one per ground MoveClass)
+    this.buildCostGrids();
 
     // Create the tick loop, passing this session as the data source
     this.tickLoop = new TickLoop(this);
+  }
+
+  // =========================================================================
+  // Cost grids
+  // =========================================================================
+
+  /**
+   * Build a cost grid for each ground MoveClass from the terrain type map and
+   * slope map. Air units always cost 1.0 so they get a flat grid.
+   *
+   * Cost = terrainTypeCost × (1 + slopePenalty)
+   *   slopePenalty = slope / IMPASSABLE_THRESHOLD (capped at 1.0)
+   *   If terrainTypeCost >= 90 OR slope >= IMPASSABLE_THRESHOLD → cell = 99 (impassable)
+   */
+  private buildCostGrids(): void {
+    const { width, height, resolution, terrainTypeMap, slopeMap } = this.terrain;
+    const moveClasses = ['track', 'wheel', 'leg', 'hover'] as const;
+
+    for (const mc of moveClasses) {
+      const data = new Float32Array(width * height);
+      for (let i = 0; i < width * height; i++) {
+        const tt = terrainTypeMap[i] as TerrainType;
+        const cost = TERRAIN_MOVE_COST[tt]?.[mc] ?? 1.0;
+        const slope = slopeMap[i] ?? 0;
+
+        if (cost >= IMPASSABLE_THRESHOLD || slope >= IMPASSABLE_THRESHOLD) {
+          data[i] = 99;
+        } else {
+          const slopePenalty = Math.min(slope / IMPASSABLE_THRESHOLD, 1.0);
+          data[i] = cost * (1 + slopePenalty);
+        }
+      }
+      this.costGrids.set(mc, { data, width, height, cellSizeM: resolution });
+    }
+
+    // Air: flat cost 1.0 everywhere
+    const airData = new Float32Array(width * height).fill(1.0);
+    this.costGrids.set('air', { data: airData, width, height, cellSizeM: resolution });
+  }
+
+  /** Get the cost grids map (one per MoveClass). */
+  getCostGrids(): Map<MoveClass, CostGrid> {
+    return this.costGrids;
   }
 
   // =========================================================================
@@ -349,6 +399,14 @@ export class GameSession {
 
   getPlayers(): Map<string, PlayerConnection> {
     return this.players;
+  }
+
+  getConnectedPlayers(): PlayerConnection[] {
+    return [...this.players.values()].filter((p) => p.isConnected);
+  }
+
+  getUnitTypeRegistry(): UnitRegistry | null {
+    return this.unitTypes;
   }
 
   getContactMap(): Map<string, Map<string, ContactEntry>> {

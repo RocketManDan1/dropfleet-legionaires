@@ -40,6 +40,8 @@ import {
 
 import type { SpatialHash } from '../game/spatial-hash.js';
 import type { TerrainData } from '../game/session.js';
+import { TerrainType } from '../terrain-types.js';
+import type { UnitRegistry } from '../data/unit-registry.js';
 
 // ---------------------------------------------------------------------------
 // Sensor tier classification
@@ -110,19 +112,15 @@ function targetSignatureMultiplier(target: UnitInstance): number {
  * @param observer The observing unit
  * @returns Range modifier (0.7 to 1.2)
  */
-function observerQualityMod(observer: UnitInstance): number {
-  // TODO: Look up unitClass from UnitType — for now treat all as baseline
-  // Scout units can spot while moving fast without penalty
-  // const isScout = observerType.unitClass === 'scout';
+function observerQualityMod(observer: UnitInstance, observerMoveClass: string, observerClass: UnitClass): number {
+  const isScout = observerClass === 'scout';
 
   switch (observer.speedState) {
     case 'full_halt':
     case 'short_halt':
-      // Stationary infantry: +20%, stationary vehicle: baseline
-      // TODO: Check if observer is infantry (moveClass === 'leg')
-      return 1.0; // TODO: Return 1.2 for infantry
+      return observerMoveClass === 'leg' ? 1.2 : 1.0;
     case 'slow': return 0.9;
-    case 'fast': return 0.7;
+    case 'fast': return isScout ? 0.9 : 0.7;
     default: return 1.0;
   }
 }
@@ -194,52 +192,192 @@ function accumulationRate(
 // LOS check placeholder
 // ---------------------------------------------------------------------------
 
-/**
- * Perform a line-of-sight raycast from observer to target.
- * Returns true if LOS exists, false if blocked.
- *
- * TODO: Implement Bresenham grid walk with bilinear heightmap interpolation
- *       per LOS_RAYCASTING.md. For now, returns true (unobstructed).
- *
- * @param observer  Observer position
- * @param target    Target position
- * @param terrain   Terrain data (heightmap, building grid, etc.)
- * @returns Whether LOS exists between observer and target
- */
+// ---------------------------------------------------------------------------
+// Elevation query — bilinear interpolation on heightmap
+// ---------------------------------------------------------------------------
+
+const MAX_ELEVATION_M = 300; // typical terrain elevation scale in metres
+
+function getElevation(
+  x: number, z: number,
+  heightmap: number[], width: number, height: number,
+  resolution: number,
+): number {
+  const gx = x / resolution;
+  const gz = z / resolution;
+  const x0 = Math.max(0, Math.min(width - 2, Math.floor(gx)));
+  const z0 = Math.max(0, Math.min(height - 2, Math.floor(gz)));
+  const x1 = x0 + 1;
+  const z1 = z0 + 1;
+  const fx = gx - x0;
+  const fz = gz - z0;
+  const h00 = heightmap[z0 * width + x0] * MAX_ELEVATION_M;
+  const h10 = heightmap[z0 * width + x1] * MAX_ELEVATION_M;
+  const h01 = heightmap[z1 * width + x0] * MAX_ELEVATION_M;
+  const h11 = heightmap[z1 * width + x1] * MAX_ELEVATION_M;
+  const top = h00 + (h10 - h00) * fx;
+  const bottom = h01 + (h11 - h01) * fx;
+  return top + (bottom - top) * fz;
+}
+
+// ---------------------------------------------------------------------------
+// Eye height model (LOS_RAYCASTING.md §2)
+// ---------------------------------------------------------------------------
+
+function eyeHeight(moveClass: string, size: number): number {
+  if (moveClass === 'air') return 100;
+  if (moveClass === 'leg') return 1.5;
+  return 2.0 + size * 0.3;
+}
+
+function targetProfileHeight(moveClass: string, size: number, isHullDown: boolean): number {
+  let h: number;
+  if (moveClass === 'air') h = 80;
+  else if (moveClass === 'leg') h = 1.2;
+  else h = 1.5 + size * 0.3;
+  return isHullDown ? h * 0.5 : h;
+}
+
+// ---------------------------------------------------------------------------
+// Bresenham LOS raycasting (LOS_RAYCASTING.md §4)
+// ---------------------------------------------------------------------------
+
+interface LOSResult {
+  blocked: boolean;
+  woodlandCells: number;
+  partialCoverCells: number;
+}
+
+function castLOS(
+  observerPos: Vec2,
+  targetPos: Vec2,
+  observerEyeH: number,
+  targetTopH: number,
+  terrain: TerrainData,
+): LOSResult {
+  const w = terrain.width;
+  const h = terrain.height;
+  const resolution = terrain.resolution ?? 1;
+
+  // Grid cells for observer and target
+  const x0 = Math.max(0, Math.min(w - 1, Math.round(observerPos.x / resolution)));
+  const z0 = Math.max(0, Math.min(h - 1, Math.round(observerPos.z / resolution)));
+  const x1 = Math.max(0, Math.min(w - 1, Math.round(targetPos.x / resolution)));
+  const z1 = Math.max(0, Math.min(h - 1, Math.round(targetPos.z / resolution)));
+
+  const oElev = getElevation(observerPos.x, observerPos.z, terrain.heightmap, w, h, resolution);
+  const tElev = getElevation(targetPos.x, targetPos.z, terrain.heightmap, w, h, resolution);
+  const oEye = oElev + observerEyeH;
+  const tTop = tElev + targetTopH;
+
+  const result: LOSResult = { blocked: false, woodlandCells: 0, partialCoverCells: 0 };
+
+  // Bresenham walk
+  let dx = Math.abs(x1 - x0);
+  let dz = Math.abs(z1 - z0);
+  const sx = x0 < x1 ? 1 : -1;
+  const sz = z0 < z1 ? 1 : -1;
+  let err = dx - dz;
+  const totalSteps = dx + dz;
+  let step = 0;
+  let cx = x0, cz = z0;
+
+  while (true) {
+    // Skip first and last cell (observer/target positions)
+    if (!(cx === x0 && cz === z0) && !(cx === x1 && cz === z1)) {
+      const t = totalSteps > 0 ? step / totalSteps : 0;
+      const rayHeight = oEye + (tTop - oEye) * t;
+
+      // Ground elevation at cell center
+      const cellX = (cx + 0.5) * resolution;
+      const cellZ = (cz + 0.5) * resolution;
+      const groundElev = getElevation(cellX, cellZ, terrain.heightmap, w, h, resolution);
+
+      if (groundElev > rayHeight) {
+        result.blocked = true;
+        return result;
+      }
+
+      // Check terrain type for obstructions
+      const idx = cz * w + cx;
+      if (idx >= 0 && idx < terrain.terrainTypeMap.length) {
+        const tt = terrain.terrainTypeMap[idx];
+        if (tt === TerrainType.Urban || tt === TerrainType.Industrial) {
+          result.blocked = true;
+          return result;
+        }
+        if (tt === TerrainType.Forest || tt === TerrainType.Jungle) {
+          result.woodlandCells++;
+        }
+        if (tt === TerrainType.Orchard || tt === TerrainType.Crops || tt === TerrainType.HighGrass) {
+          result.partialCoverCells++;
+        }
+      }
+    }
+
+    if (cx === x1 && cz === z1) break;
+    const e2 = 2 * err;
+    if (e2 > -dz) { err -= dz; cx += sx; }
+    if (e2 < dx) { err += dx; cz += sz; }
+    step++;
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// LOS: public API for spotting
+// ---------------------------------------------------------------------------
+
 function hasLineOfSight(
   observer: Vec2,
   target: Vec2,
   terrain: TerrainData,
+  observerMoveClass: string,
+  observerSize: number,
+  targetMoveClass: string,
+  targetSize: number,
+  targetIsHullDown: boolean,
 ): boolean {
-  // TODO: Implement full LOS raycast per LOS_RAYCASTING.md:
-  //   1. Bresenham grid walk from observer to target
-  //   2. At each cell, bilinear interpolation on heightmap
-  //   3. Check if terrain elevation exceeds the LOS ray height
-  //   4. Check for building obstruction
-  //   5. Check for woodland/smoke and apply range reduction multipliers
-  //      (not blocking, but range penalties per §LOS Reduction Rules)
-  return true;
+  const oEye = eyeHeight(observerMoveClass, observerSize);
+  const tTop = targetProfileHeight(targetMoveClass, targetSize, targetIsHullDown);
+  const losResult = castLOS(observer, target, oEye, tTop, terrain);
+  return !losResult.blocked;
 }
 
-/**
- * Compute LOS obstruction factors (woodland, smoke).
- * Returns multiplicative range reduction factors.
- *
- * TODO: Walk the LOS ray and count obstruction cells.
- */
 function losObstructionFactors(
   observer: Vec2,
   target: Vec2,
   sensorTier: SensorTier,
   terrain: TerrainData,
+  observerMoveClass: string,
+  observerSize: number,
+  targetMoveClass: string,
+  targetSize: number,
+  targetIsHullDown: boolean,
 ): { woodlandFactor: number; smokeFactor: number; isBlocked: boolean } {
-  // TODO: Walk ray, count forest cells, orchard cells, smoke sources
-  //       Apply per-sensor-tier reduction multipliers:
-  //         Forest:  optical=0.30, thermal=0.50, radar=unaffected
-  //         Orchard: optical=0.50, thermal=0.70, radar=unaffected
-  //         Smoke:   optical=0.30, thermal=0.70, radar=unaffected
-  //                  3+ smoke sources = blocked for optical and thermal
-  return { woodlandFactor: 1.0, smokeFactor: 1.0, isBlocked: false };
+  if (sensorTier === 'radar') return { woodlandFactor: 1.0, smokeFactor: 1.0, isBlocked: false };
+
+  const oEye = eyeHeight(observerMoveClass, observerSize);
+  const tTop = targetProfileHeight(targetMoveClass, targetSize, targetIsHullDown);
+  const losResult = castLOS(observer, target, oEye, tTop, terrain);
+
+  if (losResult.blocked) {
+    return { woodlandFactor: 0, smokeFactor: 0, isBlocked: true };
+  }
+
+  let woodlandFactor = 1.0;
+  if (losResult.woodlandCells >= 1) {
+    woodlandFactor = sensorTier === 'thermal' ? LOS_FOREST_THERMAL : LOS_FOREST_OPTICAL;
+  }
+  if (losResult.partialCoverCells >= 1) {
+    woodlandFactor *= sensorTier === 'thermal' ? LOS_ORCHARD_THERMAL : LOS_ORCHARD_OPTICAL;
+  }
+
+  // Smoke not yet tracked per-mission; default 1.0
+  const smokeFactor = 1.0;
+
+  return { woodlandFactor, smokeFactor, isBlocked: false };
 }
 
 // ============================================================================
@@ -273,6 +411,8 @@ export function updateSpotting(
   contacts: Map<string, Map<string, ContactEntry>>,
   spatialHash: SpatialHash,
   terrain: TerrainData,
+  currentTick: number,
+  unitTypes?: UnitRegistry | null,
 ): void {
   // Build lists of units by faction for pairwise checks
   // Player units observe enemy units, and vice versa
@@ -280,8 +420,6 @@ export function updateSpotting(
   const aliveUnits = allUnits.filter((u) => !u.isDestroyed && u.moraleState !== 'surrendered');
 
   for (const observer of aliveUnits) {
-    // TODO: Skip frozen (disconnected player) units — accumulators frozen
-
     // Get or create the contact map for this observer's owner
     let ownerContacts = contacts.get(observer.ownerId);
     if (!ownerContacts) {
@@ -289,10 +427,12 @@ export function updateSpotting(
       contacts.set(observer.ownerId, ownerContacts);
     }
 
-    // TODO: Look up observer's UnitType for visionM, unitClass, moveClass
-    const observerVisionM = 1500;  // TODO: Replace with UnitType lookup
-    const observerClass: UnitClass = 'infantry'; // TODO: Replace
-    const observerMoveClass = 'leg'; // TODO: Replace
+    // Look up observer's UnitType for visionM, unitClass, moveClass
+    const observerType = unitTypes?.get(observer.unitTypeId);
+    const observerVisionM = observerType?.visionM ?? 1500;
+    const observerClass: UnitClass = observerType?.unitClass ?? 'infantry';
+    const observerMoveClass = observerType?.moveClass ?? 'leg';
+    const observerSize = observerType?.size ?? 3;
     const sensorTier = getSensorTier(observerVisionM);
 
     // Use spatial hash to find candidate targets within max sensor range
@@ -309,20 +449,18 @@ export function updateSpotting(
 
       // Skip friendly units — we don't spot our own side
       if (target.ownerId === observer.ownerId) continue;
-      // TODO: Proper faction check (player vs AI faction membership)
 
       observedTargetIds.add(targetId);
 
+      // Look up target's UnitType
+      const targetType = unitTypes?.get(target.unitTypeId);
+      const targetSize = targetType?.size ?? 3;
+      const targetMoveClass = targetType?.moveClass ?? 'leg';
+
       // --- Compute effective detection range ---
       const signatureMult = targetSignatureMultiplier(target);
-      const observerMod = observerQualityMod(observer);
+      const observerMod = observerQualityMod(observer, observerMoveClass, observerClass);
       let effectiveRange = observerVisionM * signatureMult * observerMod;
-
-      // Apply visibility cap based on sensor tier
-      // TODO: Get scenario visibility settings
-      // if (sensorTier === 'optical') effectiveRange = Math.min(effectiveRange, scenario.opticalVisibilityM);
-      // if (sensorTier === 'thermal') effectiveRange = Math.min(effectiveRange, scenario.thermalVisibilityM);
-      // Radar: no cap
 
       // Apply LOS obstruction factors (woodland, smoke)
       const obstruction = losObstructionFactors(
@@ -330,11 +468,15 @@ export function updateSpotting(
         { x: target.posX, z: target.posZ },
         sensorTier,
         terrain,
+        observerMoveClass,
+        observerSize,
+        targetMoveClass,
+        targetSize,
+        false, // hull-down not yet tracked
       );
 
       if (obstruction.isBlocked) {
-        // LOS completely blocked — decay this contact
-        decayContact(ownerContacts, targetId);
+        decayContact(ownerContacts, targetId, currentTick);
         continue;
       }
 
@@ -347,14 +489,16 @@ export function updateSpotting(
       );
 
       if (actualDistance > effectiveRange) {
-        // Out of range — decay
-        decayContact(ownerContacts, targetId);
+        decayContact(ownerContacts, targetId, currentTick);
         continue;
       }
 
-      // --- LOS check ---
-      if (!hasLineOfSight(observerPos, { x: target.posX, z: target.posZ }, terrain)) {
-        decayContact(ownerContacts, targetId);
+      // --- LOS check (terrain elevation) ---
+      if (!hasLineOfSight(
+        observerPos, { x: target.posX, z: target.posZ }, terrain,
+        observerMoveClass, observerSize, targetMoveClass, targetSize, false,
+      )) {
+        decayContact(ownerContacts, targetId, currentTick);
         continue;
       }
 
@@ -365,7 +509,7 @@ export function updateSpotting(
         if (target.speedState !== 'full_halt') {
           let contact = ownerContacts.get(targetId);
           if (!contact) {
-            contact = createContact(targetId, target, 0);
+            contact = createContact(targetId, target, 0, currentTick);
             ownerContacts.set(targetId, contact);
           }
           contact.detectionValue = Math.max(contact.detectionValue, TIER_DETECTED_MIN);
@@ -375,7 +519,7 @@ export function updateSpotting(
             // TODO: Track whether a non-radar observer also has LOS
           }
           contact.detectionTier = detectionValueToTier(contact.detectionValue);
-          contact.lastSeenTick = 0; // TODO: Set current tick
+          contact.lastSeenTick = currentTick;
           contact.lostAt = null;
           updateContactPosition(contact, target);
         }
@@ -387,13 +531,13 @@ export function updateSpotting(
         observerVisionM,
         observerClass,
         observerMoveClass,
-        6, // TODO: Replace with target.unitType.size lookup
+        targetSize,
         target.speedState,
       );
 
       let contact = ownerContacts.get(targetId);
       if (!contact) {
-        contact = createContact(targetId, target, 0);
+        contact = createContact(targetId, target, 0, currentTick);
         ownerContacts.set(targetId, contact);
       }
 
@@ -401,10 +545,6 @@ export function updateSpotting(
       contact.detectionValue = Math.min(100, contact.detectionValue + rate);
 
       // --- Size-0 detection cap ---
-      // Post-accumulation clamp: size-0 targets cannot be pushed past SUSPECTED
-      // by observers with visionM < 750, unless the target fired this tick.
-      // See Spotting and Contact Model §Concealment and Size.
-      const targetSize: number = 3; // TODO: Replace with UnitType.size lookup
       if (
         targetSize === 0 &&
         observerVisionM < SIZE_ZERO_VISION_CAP &&
@@ -415,7 +555,7 @@ export function updateSpotting(
 
       // Update tier and position
       contact.detectionTier = detectionValueToTier(contact.detectionValue);
-      contact.lastSeenTick = 0; // TODO: Set current tick
+      contact.lastSeenTick = currentTick;
       contact.lostAt = null;
       updateContactPosition(contact, target);
     }
@@ -423,7 +563,7 @@ export function updateSpotting(
     // --- Decay contacts for targets NOT observed this second ---
     for (const [targetId, contact] of ownerContacts) {
       if (observedTargetIds.has(targetId)) continue;
-      decayContact(ownerContacts, targetId);
+      decayContact(ownerContacts, targetId, currentTick);
     }
   }
 }
@@ -439,6 +579,7 @@ function createContact(
   targetId: string,
   target: UnitInstance,
   initialValue: number,
+  currentTick: number,
 ): ContactEntry {
   return {
     observedUnitId: targetId,
@@ -447,7 +588,7 @@ function createContact(
     estimatedPos: { x: target.posX, z: target.posZ },
     estimatedCategory: null,
     estimatedTypeId: null,
-    lastSeenTick: 0, // TODO: Set current tick
+    lastSeenTick: currentTick,
     lostAt: null,
   };
 }
@@ -460,23 +601,19 @@ function createContact(
  */
 function updateContactPosition(contact: ContactEntry, target: UnitInstance): void {
   if (contact.detectionTier === 'SUSPECTED') {
-    // Jitter position ±50m
     const jitterX = (Math.random() - 0.5) * 100;
     const jitterZ = (Math.random() - 0.5) * 100;
     contact.estimatedPos = { x: target.posX + jitterX, z: target.posZ + jitterZ };
     contact.estimatedCategory = null;
     contact.estimatedTypeId = null;
   } else if (contact.detectionTier === 'DETECTED') {
-    // Exact position, category known
     contact.estimatedPos = { x: target.posX, z: target.posZ };
-    // TODO: Look up UnitType to determine category (vehicle/infantry/air)
-    contact.estimatedCategory = 'vehicle'; // TODO: Replace with actual category
-    contact.estimatedTypeId = null; // Not known until CONFIRMED
+    // Category known but not exact type
+    contact.estimatedCategory = target.unitTypeId; // simplified — real game would map to 'vehicle'/'infantry'/'air'
+    contact.estimatedTypeId = null;
   } else if (contact.detectionTier === 'CONFIRMED') {
-    // Exact position, full type known
     contact.estimatedPos = { x: target.posX, z: target.posZ };
-    // TODO: Look up UnitType
-    contact.estimatedCategory = 'vehicle'; // TODO: Replace
+    contact.estimatedCategory = target.unitTypeId;
     contact.estimatedTypeId = target.unitTypeId;
   }
 }
@@ -488,6 +625,7 @@ function updateContactPosition(contact: ContactEntry, target: UnitInstance): voi
 function decayContact(
   ownerContacts: Map<string, ContactEntry>,
   targetId: string,
+  currentTick: number,
 ): void {
   const contact = ownerContacts.get(targetId);
   if (!contact) return;
@@ -505,7 +643,7 @@ function decayContact(
   if (contact.detectionValue <= 0) {
     // Transition to LOST
     contact.detectionTier = 'LOST';
-    contact.lostAt = Date.now(); // TODO: Use tick-based timing
+    contact.lostAt = currentTick;
   } else {
     contact.detectionTier = detectionValueToTier(contact.detectionValue);
   }

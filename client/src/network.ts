@@ -4,16 +4,22 @@ export class GameConnection {
   private ws: WebSocket | null = null;
   private handlers: Map<string, MessageHandler[]> = new Map();
   private statusEl: HTMLElement;
+  private reconnectTimer: number | null = null;
+  private heartbeatTimer: number | null = null;
+  private useDirectPortFallback: boolean = false;
 
   constructor() {
     this.statusEl = document.getElementById('status')!;
   }
 
   connect() {
-    // In production (nginx), WebSocket is proxied on same host
-    // In dev, connect directly to server
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${location.hostname}:3000`;
+    const isDev = location.port === '5173';
+    const proxiedUrl = `${protocol}//${location.host}/ws`;
+    const directUrl = `${protocol}//${location.hostname}:3000`;
+    const wsUrl = isDev
+      ? directUrl
+      : (this.useDirectPortFallback ? directUrl : proxiedUrl);
 
     this.statusEl.textContent = 'CONNECTING...';
     this.statusEl.className = '';
@@ -23,6 +29,18 @@ export class GameConnection {
     this.ws.onopen = () => {
       this.statusEl.textContent = 'CONNECTED';
       this.statusEl.className = '';
+
+      if (this.reconnectTimer !== null) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+
+      if (this.heartbeatTimer !== null) {
+        clearInterval(this.heartbeatTimer);
+      }
+      this.heartbeatTimer = window.setInterval(() => {
+        this.send('PING', { payload: { clientTime: Date.now() } });
+      }, 15000);
     };
 
     this.ws.onmessage = (event) => {
@@ -40,12 +58,27 @@ export class GameConnection {
     this.ws.onclose = () => {
       this.statusEl.textContent = 'DISCONNECTED';
       this.statusEl.className = 'disconnected';
-      // Reconnect after 2 seconds
-      setTimeout(() => this.connect(), 2000);
+
+      if (!isDev) {
+        this.useDirectPortFallback = !this.useDirectPortFallback;
+      }
+
+      if (this.heartbeatTimer !== null) {
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+      }
+
+      if (this.reconnectTimer === null) {
+        this.reconnectTimer = window.setTimeout(() => {
+          this.reconnectTimer = null;
+          this.connect();
+        }, 2000);
+      }
     };
 
     this.ws.onerror = () => {
-      this.ws?.close();
+      this.statusEl.textContent = 'CONNECTION ERROR';
+      this.statusEl.className = 'disconnected';
     };
   }
 

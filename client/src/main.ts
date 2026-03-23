@@ -6,7 +6,15 @@ import { createProceduralBuildingDistricts } from './buildings';
 import { UnitManager } from './units/unit-manager';
 import { InputHandler, type InputCallbacks } from './input/click-handler';
 import { ClientPathfinder } from './pathfinding/client-pathfinding';
-import type { Vec2, MoraleState, FirePosture } from '@legionaires/shared';
+import type { Vec2, MoraleState, FirePosture, UnitDelta, ContactDelta, UnitSnapshot, ContactSnapshot, GameEvent } from '@legionaires/shared';
+
+// Terrain type → track cost (mirrors server TERRAIN_MOVE_COST for 'track')
+const TRACK_COST_BY_TERRAIN: Record<number, number> = {
+  0: 1.0, 1: 1.5, 2: 2.5, 3: 1.5, 4: 99, 5: 2.0, 6: 3.0, 7: 1.5,
+  8: 1.5, 9: 1.0, 10: 1.0, 11: 99, 12: 4.0, 13: 99, 14: 4.0, 15: 1.5,
+  16: 1.0, 17: 2.0, 18: 99, 19: 3.0, 20: 0.5, 21: 0.5, 22: 0.5,
+  23: 2.0, 24: 2.0,
+};
 
 // --- Scene setup ---
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -165,23 +173,29 @@ connection.on('terrain', (msg: { data: TerrainData }) => {
   const terrainSurface = terrainGroup.getObjectByName('terrain-surface');
   if (terrainSurface) inputHandler.setTerrainMesh(terrainSurface);
 
-  // Build cost grid from terrain data — mark water as impassable,
-  // weight slopes, and leave dry flat land at cost 1.0
+  // Build cost grid from terrain type data for client pathfinding preview.
+  // Uses the 'track' MoveClass costs as the default for path previews.
   const { width, height, resolution } = msg.data;
   const costs = new Float32Array(width * height);
+  const ttMap = msg.data.terrainTypeMap;
   for (let i = 0; i < width * height; i++) {
-    const hNorm = msg.data.heightmap[i];
-    // Water: cells at or below sea level are impassable
-    if (hNorm <= msg.data.seaLevel) {
-      costs[i] = 95; // above IMPASSABLE_THRESHOLD (90)
-      continue;
-    }
-    // Slope: higher slope = higher cost
-    const slope = msg.data.slopeMap?.[i] ?? 0;
-    if (slope > 0.85) {
-      costs[i] = 95; // very steep = impassable
+    if (ttMap) {
+      // Use terrain type cost table (track MoveClass)
+      const ttCost = TRACK_COST_BY_TERRAIN[ttMap[i]] ?? 1.0;
+      const slope = msg.data.slopeMap?.[i] ?? 0;
+      if (ttCost >= 90 || slope >= 90) {
+        costs[i] = 95;
+      } else {
+        costs[i] = ttCost * (1 + Math.min(slope / 90, 1.0));
+      }
     } else {
-      costs[i] = 1.0 + slope * 4.0; // gentle slopes up to ~4.4 cost
+      // Fallback: heightmap + slope only
+      if (msg.data.heightmap[i] <= msg.data.seaLevel) {
+        costs[i] = 95;
+      } else {
+        const slope = msg.data.slopeMap?.[i] ?? 0;
+        costs[i] = slope > 0.85 ? 95 : 1.0 + slope * 4.0;
+      }
     }
   }
   pathfinder.setCostGrid({ data: costs, width, height, cellSizeM: resolution });
@@ -234,6 +248,33 @@ connection.on('terrain', (msg: { data: TerrainData }) => {
   console.log(`Test unit spawned at (${cx.toFixed(0)}, ${cz.toFixed(0)})`);
 });
 
+// --- TICK_UPDATE handler: apply server-authoritative state deltas ---
+connection.on('TICK_UPDATE', (msg: { payload: { tick: number; missionTimeSec: number; unitDeltas: UnitDelta[]; contactDeltas: ContactDelta[]; events: GameEvent[] } }) => {
+  const { unitDeltas, contactDeltas } = msg.payload;
+
+  if (unitDeltas.length > 0) {
+    unitManager.applyUnitDeltas(unitDeltas);
+    // Update Y positions from terrain
+    for (const delta of unitDeltas) {
+      if (delta.posX === undefined) continue;
+      const unit = unitManager.getUnit(delta.unitId);
+      if (!unit) continue;
+      const y = cameraController.getTerrainHeight(unit.posX, unit.posZ);
+      unit.sceneGroup.position.setY(y);
+    }
+  }
+
+  if (contactDeltas.length > 0) {
+    unitManager.applyContactDeltas(contactDeltas);
+  }
+});
+
+// --- MISSION_STATE_FULL handler: full state reset (join / reconnect) ---
+connection.on('MISSION_STATE_FULL', (msg: { payload: { units: UnitSnapshot[]; contacts: ContactSnapshot[] } }) => {
+  const { units, contacts } = msg.payload;
+  unitManager.applyFullSnapshot(units, contacts);
+});
+
 connection.connect();
 
 // Terrain regeneration hotkey (G)
@@ -251,10 +292,18 @@ window.addEventListener('keydown', (e) => {
 
 // --- M1 client-side movement integration ---
 // In M2 this is replaced by server-authoritative movement via the tick loop.
-const UNIT_SPEED_M_PER_SEC = 8; // ~30 km/h, roughly MBT road speed
+//
+// Positions (posX/posZ) are in CELL INDICES. Terrain resolution (m/cell) converts
+// real-world m/s speeds into cells/sec so the unit moves at the correct visual pace.
+//   8 m/s ÷ 20 m/cell = 0.4 cells/sec ≈ 29 km/h advance speed
+const UNIT_SPEED_M_PER_SEC = 8; // ~29 km/h cross-country advance
 
 function tickClientMovement(dt: number): void {
   if (!currentTerrainData) return;
+
+  // Convert m/s → cells/sec using the terrain's real-world cell size
+  const resolution = currentTerrainData.resolution; // m per cell (20)
+  const speedCellsPerSec = UNIT_SPEED_M_PER_SEC / resolution;
 
   for (const [unitId, move] of unitMoves) {
     const unit = unitManager.getUnit(unitId);
@@ -272,7 +321,7 @@ function tickClientMovement(dt: number): void {
     const dx = target.x - unit.posX;
     const dz = target.z - unit.posZ;
     const dist = Math.sqrt(dx * dx + dz * dz);
-    const stepDist = UNIT_SPEED_M_PER_SEC * dt;
+    const stepDist = speedCellsPerSec * dt;
 
     if (stepDist >= dist) {
       // Arrived at this waypoint

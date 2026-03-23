@@ -16,3 +16,5 @@ services:
       - "3000:3000"
     volumes:
       - ./data:/app/data
+      - ./New Direction Docs:/app/New Direction Docs:ro
+      - ./Unit Testing:/app/Unit Testing:ro

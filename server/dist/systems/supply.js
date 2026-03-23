@@ -11,16 +11,17 @@ import { SUPPLY_RANGE_M, SUPPRESSION_PIN_THRESHOLD } from '@legionaires/shared';
  * Phase 8: Supply Tick.
  * Trickle ammo resupply from nearby supply vehicles.
  */
-export function tickSupply(units, spatialHash, _dt) {
+export function tickSupply(units, spatialHash, _dt, unitTypes) {
     const resuppliedUnitIds = [];
-    // Find all supply vehicles
+    // Find all supply vehicles (unitClass === 'supply')
     const supplyUnits = [];
     for (const [_id, unit] of units) {
         if (unit.isDestroyed)
             continue;
-        // TODO: Check unit.unitTypeId against UnitRegistry to confirm unitClass === 'supply'
-        // For now, placeholder check
-        supplyUnits.push(unit);
+        const ut = unitTypes?.get(unit.unitTypeId);
+        if (ut?.unitClass === 'supply') {
+            supplyUnits.push(unit);
+        }
     }
     for (const [_id, unit] of units) {
         if (unit.isDestroyed)
@@ -47,7 +48,7 @@ export function tickSupply(units, spatialHash, _dt) {
         }
         // Trickle resupply: (startingAmmo / 180) per second per ammo type
         unit.isBeingResupplied = true;
-        resupplyUnit(unit);
+        resupplyUnit(unit, unitTypes ?? null);
         resuppliedUnitIds.push(unit.instanceId);
     }
     return { resuppliedUnitIds };
@@ -63,17 +64,21 @@ function findNearbySupplyUnit(unit, supplyUnits, _spatialHash) {
     }
     return null;
 }
-function resupplyUnit(unit) {
-    // TODO: Look up starting ammo from UnitType via registry
-    // Trickle rate = startingAmmo / 180 per second per type
-    // For each weapon slot, add trickle to current ammo (capped at starting max)
+function resupplyUnit(unit, unitTypes) {
+    const ut = unitTypes?.get(unit.unitTypeId);
     for (let slot = 0; slot < 4; slot++) {
         const ammo = unit.ammo[slot];
         if (!ammo)
             continue;
-        // Placeholder: add 1 round per type per second
-        // Real impl needs starting values from UnitType.weapons[slot]
-        ammo.he = Math.min(ammo.he + 1, 999); // TODO: cap at starting value
-        ammo.ap = Math.min(ammo.ap + 1, 999);
+        const wpn = ut?.weapons[slot];
+        const startHE = wpn?.ammoHE ?? 50;
+        const startAP = wpn?.ammoAP ?? 20;
+        const startHEAT = wpn?.ammoHEAT ?? 0;
+        const startSabot = wpn?.ammoSabot ?? 0;
+        // Trickle rate: startingAmmo / 180 per second
+        ammo.he = Math.min(ammo.he + startHE / 180, startHE);
+        ammo.ap = Math.min(ammo.ap + startAP / 180, startAP);
+        ammo.heat = Math.min(ammo.heat + startHEAT / 180, startHEAT);
+        ammo.sabot = Math.min(ammo.sabot + startSabot / 180, startSabot);
     }
 }

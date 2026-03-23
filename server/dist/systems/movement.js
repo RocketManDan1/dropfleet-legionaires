@@ -128,7 +128,7 @@ function getTerrainCost(costGrids, moveClass, x, z) {
  * @param terrain    Terrain data (heightmap, etc.)
  * @param costGrids  Cost grids keyed by MoveClass (built at mission start)
  */
-export function resolveMovement(units, dt, terrain, costGrids) {
+export function resolveMovement(units, dt, terrain, costGrids, unitTypes) {
     for (const [unitId, unit] of units) {
         // Skip dead, surrendered, or frozen units
         if (unit.isDestroyed)
@@ -181,10 +181,10 @@ export function resolveMovement(units, dt, terrain, costGrids) {
         const waypoint = unit.currentPath[unit.pathIndex];
         const unitPos = { x: unit.posX, z: unit.posZ };
         // --- Compute effective speed at current position ---
-        // TODO: Look up moveClass from UnitType (requires UnitRegistry access)
-        const moveClass = 'track'; // TODO: Replace with actual unit move class
+        const ut = unitTypes?.get(unit.unitTypeId);
+        const moveClass = ut?.moveClass ?? 'track';
         const cellCost = getTerrainCost(costGrids, moveClass, unit.posX, unit.posZ);
-        const maxSpeedM = 10; // TODO: Replace with UnitType.maxSpeedM lookup
+        const maxSpeedM = ut?.maxSpeedM ?? 10;
         const speed = effectiveSpeed(maxSpeedM, unit.moveMode, cellCost);
         // --- Move toward waypoint ---
         const distToWaypoint = distanceBetween(unitPos, waypoint);

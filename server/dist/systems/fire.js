@@ -14,7 +14,7 @@ import { TIER_DETECTED_MIN, } from '@legionaires/shared';
  * Processes auto-fire and player engage orders, produces ShotRecord array
  * for Phase 6 (Damage Application).
  */
-export function resolveFire(units, contacts, playerFireOrders, tick) {
+export function resolveFire(units, contacts, playerFireOrders, tick, unitTypes) {
     const shotRecords = [];
     const rejectedOrders = [];
     // --- 5a: Auto-fire (FREE_FIRE posture units) ---
@@ -28,7 +28,7 @@ export function resolveFire(units, contacts, playerFireOrders, tick) {
         const target = selectAutoFireTarget(unit, units, contacts);
         if (!target)
             continue;
-        const shot = attemptFire(unit, target, units, contacts, tick);
+        const shot = attemptFire(unit, target, units, contacts, tick, undefined, unitTypes ?? null);
         if (shot) {
             shotRecords.push(shot);
             unit.firedThisTick = true;
@@ -51,7 +51,7 @@ export function resolveFire(units, contacts, playerFireOrders, tick) {
             rejectedOrders.push({ unitId: order.unitId, reason: 'TARGET_NOT_FOUND' });
             continue;
         }
-        const shot = attemptFire(unit, targetUnit, units, contacts, tick, order.weaponSlot);
+        const shot = attemptFire(unit, targetUnit, units, contacts, tick, order.weaponSlot, unitTypes ?? null);
         if (shot) {
             shotRecords.push(shot);
             unit.firedThisTick = true;
@@ -63,7 +63,7 @@ export function resolveFire(units, contacts, playerFireOrders, tick) {
     return { shotRecords, rejectedOrders };
 }
 // --- Helper: attempt to fire one shot ---
-function attemptFire(firer, target, units, contacts, tick, preferredSlot) {
+function attemptFire(firer, target, units, contacts, tick, preferredSlot, unitTypes) {
     // 1. DETECTED gate: firer must have target at DETECTED+ in own accumulator
     const firerContacts = contacts.get(firer.ownerId);
     const contact = firerContacts?.get(target.instanceId);
@@ -82,15 +82,27 @@ function attemptFire(firer, target, units, contacts, tick, preferredSlot) {
         return null;
     // 5. Check range
     const range = distance(firer, target);
-    // TODO: get weapon maxRange from UnitType registry lookup
-    // if (range > weapon.rangeM) return null;
+    const firerType = unitTypes?.get(firer.unitTypeId);
+    const weapon = firerType?.weapons[slot] ?? null;
+    const weaponMaxRange = weapon?.rangeM ?? 2000;
+    if (range > weaponMaxRange)
+        return null;
     // 6. Check suppression threshold
     if (firer.suppressionLevel >= 40 && firer.moraleState === 'pinned')
         return null;
     // 7. Select ammo type
     const ammoType = selectAmmoType(ammo, target);
     // 8. Consume ammo and apply cooldown
-    // TODO: decrement ammo[slot][ammoType], set cooldown from weapon ROF
+    if (ammoType === 'HE')
+        ammo.he = Math.max(0, ammo.he - 1);
+    if (ammoType === 'AP')
+        ammo.ap = Math.max(0, ammo.ap - 1);
+    if (ammoType === 'HEAT')
+        ammo.heat = Math.max(0, ammo.heat - 1);
+    if (ammoType === 'Sabot')
+        ammo.sabot = Math.max(0, ammo.sabot - 1);
+    firer.weaponCooldowns[slot] = 10;
+    firer.lastFireTick = tick;
     // 9. Build shot record
     return {
         shotId: `shot_${tick}_${firer.instanceId}_${slot}`,
@@ -105,16 +117,44 @@ function attemptFire(firer, target, units, contacts, tick, preferredSlot) {
     };
 }
 // --- Helper: auto-fire target selection ---
-function selectAutoFireTarget(firer, _units, _contacts) {
-    // TODO: Select highest-priority DETECTED+ enemy within weapon range
-    // Priority: closest threat, then highest value
-    return null;
+function selectAutoFireTarget(firer, units, contacts) {
+    const firerContacts = contacts.get(firer.ownerId);
+    if (!firerContacts)
+        return null;
+    let best = null;
+    let bestRange = Number.POSITIVE_INFINITY;
+    for (const [contactId, contact] of firerContacts) {
+        if (contact.detectionValue < TIER_DETECTED_MIN)
+            continue;
+        const target = units.get(contactId);
+        if (!target || target.isDestroyed || target.ownerId === firer.ownerId)
+            continue;
+        const range = distance(firer, target);
+        if (range < bestRange) {
+            best = target;
+            bestRange = range;
+        }
+    }
+    return best;
 }
 // --- Helper: weapon slot selection ---
-function selectBestWeaponSlot(_firer, _target) {
-    // TODO: Select slot with ammo, in range, best damage vs target type
-    // Prefer AP/Sabot vs armoured, HE vs infantry
-    return 0;
+function selectBestWeaponSlot(firer, target) {
+    const targetLooksArmored = target.steelArmour.hullFront > 20 || target.steelArmour.turretFront > 20;
+    const preferredOrder = targetLooksArmored
+        ? ['sabot', 'ap', 'heat', 'he']
+        : ['he', 'ap', 'heat', 'sabot'];
+    for (const ammoType of preferredOrder) {
+        for (let slot = 0; slot < firer.ammo.length; slot++) {
+            const ammo = firer.ammo[slot];
+            if (!ammo)
+                continue;
+            if (firer.weaponCooldowns[slot] > 0)
+                continue;
+            if (ammo[ammoType] > 0)
+                return slot;
+        }
+    }
+    return null;
 }
 // --- Helper: ammo type selection ---
 function selectAmmoType(ammo, _target) {

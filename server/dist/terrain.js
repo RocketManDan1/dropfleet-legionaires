@@ -1,5 +1,6 @@
 import { createNoise2D } from 'simplex-noise';
 import { getPreset, normalizeSeed } from './batloc.js';
+import { TERRAIN_MOVE_COST } from './terrain-types.js';
 const BIOME_PARAMS = {
     mountains: {
         octaves: 8,
@@ -427,8 +428,328 @@ function buildSpawnZones(width, height, terrainTypeMap, seaLevel, heightmap) {
     }
     return [attacker, defender];
 }
-function buildObjectives(width, height, towns, bridges, fords, heightmap) {
+// ── River extraction from flow accumulation ─────────────────────────────────
+function extractRivers(heightmap, width, height, seaLevel, batloc, seed) {
+    // Build raw (un-normalised) flow accumulation to get absolute values
+    const flow = new Float32Array(width * height);
+    for (let i = 0; i < flow.length; i++)
+        flow[i] = 1;
+    const order = new Array(flow.length);
+    for (let i = 0; i < order.length; i++)
+        order[i] = i;
+    order.sort((a, b) => heightmap[b] - heightmap[a]);
+    const downhill = new Int32Array(width * height).fill(-1);
+    const offsets = [
+        [-1, -1], [0, -1], [1, -1],
+        [-1, 0], [1, 0],
+        [-1, 1], [0, 1], [1, 1],
+    ];
+    for (let n = 0; n < order.length; n++) {
+        const idx = order[n];
+        const x = idx % width;
+        const z = Math.floor(idx / width);
+        const h0 = heightmap[idx];
+        let best = -1;
+        let bestDrop = 0;
+        for (let i = 0; i < offsets.length; i++) {
+            const nx = x + offsets[i][0];
+            const nz = z + offsets[i][1];
+            if (nx < 0 || nx >= width || nz < 0 || nz >= height)
+                continue;
+            const nIdx = nz * width + nx;
+            const drop = h0 - heightmap[nIdx];
+            if (drop > bestDrop) {
+                bestDrop = drop;
+                best = nIdx;
+            }
+        }
+        downhill[idx] = best;
+        if (best >= 0)
+            flow[best] += flow[idx];
+    }
+    // Threshold: cells with high flow AND above sea level are river candidates
+    const density = batloc.streamsMarsh ?? 3;
+    const flowThreshold = (width * height) * (0.005 + (10 - density) * 0.002);
+    // Mark river cells
+    const isRiver = new Uint8Array(width * height);
+    for (let i = 0; i < flow.length; i++) {
+        if (flow[i] >= flowThreshold && heightmap[i] > seaLevel) {
+            isRiver[i] = 1;
+        }
+    }
+    // Trace river paths: start from highest flow cells, follow downhill
+    const visited = new Uint8Array(width * height);
+    const startCells = [];
+    for (let i = 0; i < flow.length; i++) {
+        if (isRiver[i])
+            startCells.push({ idx: i, flow: flow[i] });
+    }
+    startCells.sort((a, b) => b.flow - a.flow);
+    const rivers = [];
+    const maxRivers = Math.max(1, Math.min(5, Math.floor(density / 2)));
+    for (const start of startCells) {
+        if (rivers.length >= maxRivers)
+            break;
+        if (visited[start.idx])
+            continue;
+        // Walk upstream to find the headwater
+        // Find highest-flow unvisited cell that flows into a chain leading here
+        const path = [];
+        let cur = start.idx;
+        let steps = 0;
+        const maxSteps = width + height;
+        while (cur >= 0 && steps < maxSteps) {
+            if (visited[cur])
+                break;
+            visited[cur] = 1;
+            const cx = cur % width;
+            const cz = Math.floor(cur / width);
+            path.push({ x: cx, z: cz });
+            // Terminate at water/edge
+            if (heightmap[cur] <= seaLevel)
+                break;
+            const next = downhill[cur];
+            if (next < 0)
+                break;
+            cur = next;
+            steps++;
+        }
+        if (path.length >= 8) {
+            const avgFlow = path.reduce((s, p) => s + flow[p.z * width + p.x], 0) / path.length;
+            const w = avgFlow > flowThreshold * 8 ? 'wide'
+                : avgFlow > flowThreshold * 3 ? 'river'
+                    : 'stream';
+            rivers.push({ path, width: w });
+        }
+    }
+    return rivers;
+}
+// ── Stamp rivers onto terrain type map ──────────────────────────────────────
+function stampRiversOnTerrain(terrainTypeMap, width, rivers) {
+    for (const river of rivers) {
+        const brushSize = river.width === 'wide' ? 2 : river.width === 'river' ? 1 : 0;
+        for (const pt of river.path) {
+            for (let dz = -brushSize; dz <= brushSize; dz++) {
+                for (let dx = -brushSize; dx <= brushSize; dx++) {
+                    const nx = Math.round(pt.x) + dx;
+                    const nz = Math.round(pt.z) + dz;
+                    if (nx < 0 || nx >= width || nz < 0 || nz >= Math.floor(terrainTypeMap.length / width))
+                        continue;
+                    const idx = nz * width + nx;
+                    if (terrainTypeMap[idx] !== 23 /* TerrainType.Urban */ && terrainTypeMap[idx] !== 24 /* TerrainType.Industrial */) {
+                        terrainTypeMap[idx] = brushSize > 0 && (Math.abs(dx) === brushSize || Math.abs(dz) === brushSize)
+                            ? 19 /* TerrainType.ShallowWater */
+                            : 18 /* TerrainType.Water */;
+                    }
+                }
+            }
+        }
+    }
+}
+// ── Road network A* between towns ───────────────────────────────────────────
+function buildRoadNetwork(width, height, towns, terrainTypeMap, slopeMap, heightmap, seaLevel, seed) {
+    if (towns.length < 2)
+        return [];
+    const roads = [];
+    // Connect towns using minimum spanning tree approach (Prim's)
+    const connected = new Set([0]);
+    const unconnected = new Set();
+    for (let i = 1; i < towns.length; i++)
+        unconnected.add(i);
+    while (unconnected.size > 0) {
+        let bestDist = Infinity;
+        let bestFrom = 0;
+        let bestTo = 0;
+        for (const ci of connected) {
+            for (const ui of unconnected) {
+                const d = Math.hypot(towns[ci].x - towns[ui].x, towns[ci].z - towns[ui].z);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestFrom = ci;
+                    bestTo = ui;
+                }
+            }
+        }
+        connected.add(bestTo);
+        unconnected.delete(bestTo);
+        const path = roadAStar(towns[bestFrom], towns[bestTo], width, height, terrainTypeMap, slopeMap, heightmap, seaLevel);
+        if (path.length >= 2) {
+            const isPrimary = towns[bestFrom].type === 'town' || towns[bestTo].type === 'town';
+            roads.push({
+                path,
+                type: isPrimary ? 'primary' : 'secondary',
+            });
+        }
+    }
+    return roads;
+}
+/** Simple A* for road routing between two points on the terrain grid. */
+function roadAStar(from, to, width, height, terrainTypeMap, slopeMap, heightmap, seaLevel) {
+    const sx = Math.round(Math.max(0, Math.min(width - 1, from.x)));
+    const sz = Math.round(Math.max(0, Math.min(height - 1, from.z)));
+    const gx = Math.round(Math.max(0, Math.min(width - 1, to.x)));
+    const gz = Math.round(Math.max(0, Math.min(height - 1, to.z)));
+    if (sx === gx && sz === gz)
+        return [{ x: sx, z: sz }];
+    const size = width * height;
+    const gScore = new Float32Array(size).fill(Infinity);
+    const parent = new Int32Array(size).fill(-1);
+    const closed = new Uint8Array(size);
+    // Simple open list (not a heap — roads are infrequent, max ~7 per map)
+    const open = [];
+    const fScore = new Float32Array(size).fill(Infinity);
+    const startIdx = sz * width + sx;
+    const goalIdx = gz * width + gx;
+    gScore[startIdx] = 0;
+    fScore[startIdx] = Math.hypot(gx - sx, gz - sz);
+    open.push(startIdx);
+    const offsets = [
+        [-1, -1], [0, -1], [1, -1],
+        [-1, 0], [1, 0],
+        [-1, 1], [0, 1], [1, 1],
+    ];
+    let iterations = 0;
+    const maxIterations = size / 2; // cap to prevent runaway
+    while (open.length > 0 && iterations < maxIterations) {
+        iterations++;
+        // Find lowest fScore in open
+        let bestI = 0;
+        for (let i = 1; i < open.length; i++) {
+            if (fScore[open[i]] < fScore[open[bestI]])
+                bestI = i;
+        }
+        const current = open[bestI];
+        open[bestI] = open[open.length - 1];
+        open.pop();
+        if (current === goalIdx)
+            break;
+        if (closed[current])
+            continue;
+        closed[current] = 1;
+        const cx = current % width;
+        const cz = Math.floor(current / width);
+        for (const [odx, odz] of offsets) {
+            const nx = cx + odx;
+            const nz = cz + odz;
+            if (nx < 0 || nx >= width || nz < 0 || nz >= height)
+                continue;
+            const nIdx = nz * width + nx;
+            if (closed[nIdx])
+                continue;
+            // Cost: prefer flat, open terrain; avoid water
+            const tt = terrainTypeMap[nIdx];
+            let moveCost = TERRAIN_MOVE_COST[tt]?.wheel ?? 1.0;
+            if (moveCost >= 90)
+                moveCost = 20; // water crossable but expensive (bridges will be placed)
+            if (heightmap[nIdx] <= seaLevel)
+                moveCost = 15;
+            const slopePenalty = 1.0 + (slopeMap[nIdx] ?? 0) * 3.0;
+            const stepDist = (odx !== 0 && odz !== 0) ? 1.414 : 1.0;
+            const tentative = gScore[current] + stepDist * moveCost * slopePenalty;
+            if (tentative < gScore[nIdx]) {
+                gScore[nIdx] = tentative;
+                parent[nIdx] = current;
+                fScore[nIdx] = tentative + Math.hypot(gx - nx, gz - nz);
+                open.push(nIdx);
+            }
+        }
+    }
+    // Reconstruct path
+    if (parent[goalIdx] === -1 && goalIdx !== startIdx)
+        return [];
+    const path = [];
+    let cur = goalIdx;
+    while (cur !== -1) {
+        path.push({ x: cur % width, z: Math.floor(cur / width) });
+        cur = parent[cur];
+    }
+    path.reverse();
+    return path;
+}
+// ── Stamp roads onto terrain type map ───────────────────────────────────────
+function stampRoadsOnTerrain(terrainTypeMap, width, roads) {
+    for (const road of roads) {
+        for (const pt of road.path) {
+            const idx = Math.round(pt.z) * width + Math.round(pt.x);
+            if (idx >= 0 && idx < terrainTypeMap.length) {
+                const existing = terrainTypeMap[idx];
+                // Don't overwrite water (bridges handle that) or urban
+                if (existing !== 18 /* TerrainType.Water */ && existing !== 19 /* TerrainType.ShallowWater */ &&
+                    existing !== 23 /* TerrainType.Urban */ && existing !== 24 /* TerrainType.Industrial */) {
+                    terrainTypeMap[idx] = 20 /* TerrainType.Road */;
+                }
+            }
+        }
+    }
+}
+// ── Bridge and ford placement ───────────────────────────────────────────────
+function placeBridgesAndFords(width, height, roads, rivers, terrainTypeMap, heightmap, seaLevel) {
+    const bridges = [];
+    const fords = [];
+    // Build a set of river cells for fast lookup
+    const riverCells = new Set();
+    for (const river of rivers) {
+        const brushSize = river.width === 'wide' ? 2 : river.width === 'river' ? 1 : 0;
+        for (const pt of river.path) {
+            for (let dz = -brushSize; dz <= brushSize; dz++) {
+                for (let dx = -brushSize; dx <= brushSize; dx++) {
+                    const nx = Math.round(pt.x) + dx;
+                    const nz = Math.round(pt.z) + dz;
+                    if (nx >= 0 && nx < width && nz >= 0 && nz < height) {
+                        riverCells.add(nz * width + nx);
+                    }
+                }
+            }
+        }
+    }
+    // Find road cells that cross river cells => bridges
+    const bridgeSet = new Set();
+    for (const road of roads) {
+        for (const pt of road.path) {
+            const rx = Math.round(pt.x);
+            const rz = Math.round(pt.z);
+            const idx = rz * width + rx;
+            if (riverCells.has(idx) && !bridgeSet.has(`${rx},${rz}`)) {
+                bridgeSet.add(`${rx},${rz}`);
+                bridges.push({
+                    x: rx,
+                    z: rz,
+                    roadType: road.type,
+                    maxWeightClass: road.type === 'primary' ? 60 : 30,
+                });
+                // Stamp bridge on terrain
+                if (idx >= 0 && idx < terrainTypeMap.length) {
+                    terrainTypeMap[idx] = 21 /* TerrainType.Bridge */;
+                }
+            }
+        }
+    }
+    // Find shallow river crossings not already bridged => fords
+    for (const river of rivers) {
+        if (river.width === 'wide')
+            continue; // wide rivers can't be forded
+        for (let i = 0; i < river.path.length; i += 15) { // check every ~15 cells
+            const pt = river.path[i];
+            const rx = Math.round(pt.x);
+            const rz = Math.round(pt.z);
+            if (bridgeSet.has(`${rx},${rz}`))
+                continue;
+            // Check if area is shallow enough
+            const idx = rz * width + rx;
+            if (idx >= 0 && idx < heightmap.length && heightmap[idx] > seaLevel - 0.01) {
+                fords.push({ x: rx, z: rz });
+                if (idx < terrainTypeMap.length) {
+                    terrainTypeMap[idx] = 19 /* TerrainType.ShallowWater */;
+                }
+            }
+        }
+    }
+    return { bridges, fords };
+}
+// ── Enhanced objective generation ───────────────────────────────────────────
+function buildObjectives(width, height, towns, bridges, fords, roads, heightmap) {
     const out = [];
+    // Town/industrial objectives
     for (let i = 0; i < towns.length; i++) {
         const t = towns[i];
         out.push({
@@ -439,6 +760,7 @@ function buildObjectives(width, height, towns, bridges, fords, heightmap) {
             type: t.type === 'industrial' ? 'industrial' : 'town',
         });
     }
+    // Bridge objectives
     for (let i = 0; i < bridges.length; i++) {
         const b = bridges[i];
         out.push({
@@ -449,6 +771,7 @@ function buildObjectives(width, height, towns, bridges, fords, heightmap) {
             type: 'bridge',
         });
     }
+    // Ford objectives
     for (let i = 0; i < fords.length; i++) {
         const f = fords[i];
         out.push({
@@ -459,19 +782,77 @@ function buildObjectives(width, height, towns, bridges, fords, heightmap) {
             type: 'ford',
         });
     }
-    // Add one simple hilltop objective at the highest cell.
-    let maxIdx = 0;
-    for (let i = 1; i < heightmap.length; i++) {
-        if (heightmap[i] > heightmap[maxIdx])
-            maxIdx = i;
+    // Crossroads: find road cells where 3+ road segments meet
+    const roadCellCount = new Map();
+    for (const road of roads) {
+        const visited = new Set();
+        for (const pt of road.path) {
+            const key = `${Math.round(pt.x)},${Math.round(pt.z)}`;
+            if (!visited.has(key)) {
+                visited.add(key);
+                roadCellCount.set(key, (roadCellCount.get(key) ?? 0) + 1);
+            }
+        }
     }
-    out.push({
-        id: 'obj-hilltop-1',
-        label: 'Hilltop',
-        x: maxIdx % width,
-        z: Math.floor(maxIdx / width),
-        type: 'hilltop',
-    });
+    let crossroadCount = 0;
+    for (const [key, count] of roadCellCount) {
+        if (count >= 2) { // cell used by 2+ different roads = junction
+            const [xs, zs] = key.split(',');
+            const x = parseInt(xs, 10);
+            const z = parseInt(zs, 10);
+            // Skip if too close to an existing objective
+            const tooClose = out.some(o => Math.hypot(o.x - x, o.z - z) < 20);
+            if (tooClose)
+                continue;
+            crossroadCount++;
+            out.push({
+                id: `obj-crossroads-${crossroadCount}`,
+                label: 'Crossroads',
+                x,
+                z,
+                type: 'crossroads',
+            });
+            if (crossroadCount >= 3)
+                break; // cap at 3
+        }
+    }
+    // Hilltop objectives: find cells in the top 1% of elevation
+    const sorted = heightmap.slice().sort((a, b) => b - a);
+    const hilltopThreshold = sorted[Math.max(0, Math.floor(sorted.length * 0.01))];
+    let hilltopCount = 0;
+    for (let i = 0; i < heightmap.length && hilltopCount < 3; i++) {
+        if (heightmap[i] >= hilltopThreshold) {
+            const hx = i % width;
+            const hz = Math.floor(i / width);
+            // Skip if too close to existing objectives
+            const tooClose = out.some(o => Math.hypot(o.x - hx, o.z - hz) < 30);
+            if (tooClose)
+                continue;
+            hilltopCount++;
+            out.push({
+                id: `obj-hilltop-${hilltopCount}`,
+                label: 'Hilltop',
+                x: hx,
+                z: hz,
+                type: 'hilltop',
+            });
+        }
+    }
+    // Ensure at least one hilltop
+    if (hilltopCount === 0) {
+        let maxIdx = 0;
+        for (let i = 1; i < heightmap.length; i++) {
+            if (heightmap[i] > heightmap[maxIdx])
+                maxIdx = i;
+        }
+        out.push({
+            id: 'obj-hilltop-1',
+            label: 'Hilltop',
+            x: maxIdx % width,
+            z: Math.floor(maxIdx / width),
+            type: 'hilltop',
+        });
+    }
     return out;
 }
 // ── Generator ───────────────────────────────────────────────────────────────
@@ -549,13 +930,14 @@ export function generateTerrain(width = 400, height = 400, seedOrOptions) {
     const { slopeMap, curvatureMap, wetnessMap, coverMap, visibilityMap, } = buildDerivedMaps(heightmap, width, height);
     const towns = generateTownAnchors(width, height, seaLevel, heightmap, slopeMap, wetnessMap, coverMap, baseSeed);
     const terrainTypeMap = classifyTerrainTypes(width, height, heightmap, slopeMap, wetnessMap, coverMap, seaLevel, batloc, towns);
-    // MVP scaffolding for feature graph layers. Later milestones fill these in.
-    const rivers = [];
-    const roads = [];
-    const bridges = [];
-    const fords = [];
+    // ── Feature graph layers ──────────────────────────────────────────────────
+    const rivers = extractRivers(heightmap, width, height, seaLevel, batloc, baseSeed);
+    stampRiversOnTerrain(terrainTypeMap, width, rivers);
+    const roads = buildRoadNetwork(width, height, towns, terrainTypeMap, slopeMap, heightmap, seaLevel, baseSeed);
+    stampRoadsOnTerrain(terrainTypeMap, width, roads);
+    const { bridges, fords } = placeBridgesAndFords(width, height, roads, rivers, terrainTypeMap, heightmap, seaLevel);
     const spawnZones = buildSpawnZones(width, height, terrainTypeMap, seaLevel, heightmap);
-    const objectives = buildObjectives(width, height, towns, bridges, fords, heightmap);
+    const objectives = buildObjectives(width, height, towns, bridges, fords, roads, heightmap);
     return {
         width,
         height,

@@ -55,8 +55,9 @@ const MAX_RENDERS_PER_FRAME = 5;
 /** Maximum icon cache memory budget in bytes (~1.5 MB). */
 const MAX_CACHE_BYTES = 1_500_000;
 
-/** Default icon canvas size in pixels. */
-const ICON_SIZE = 64;
+/** Icon canvas dimensions. Taller than wide to fit frame + labels below. */
+const ICON_W = 64;
+const ICON_H = 80;
 
 /** Health bar dimensions relative to icon. */
 const HEALTH_BAR_WIDTH = 48;
@@ -303,8 +304,9 @@ export class UnitRenderer {
     });
 
     const sprite = new THREE.Sprite(material);
-    sprite.scale.set(0.08, 0.08, 1); // screen-space scale
-    sprite.position.set(0, 5, 0);    // float above terrain surface
+    // Scale maintains canvas aspect ratio (64×80) so labels don't squish.
+    sprite.scale.set(0.08, 0.08 * (ICON_H / ICON_W), 1);
+    sprite.position.set(0, 5, 0); // float above terrain surface
     sprite.userData = {
       cacheKey: buildCacheKey(
         descriptor.unitTypeId,
@@ -365,118 +367,252 @@ export class UnitRenderer {
   }
 
   /**
-   * Renders a NATO icon to an offscreen canvas.
+   * Renders a DRONECOM-style NATO icon to an offscreen canvas.
    *
-   * TODO: Integrate milsymbol library for proper NATO 2525C/D symbol rendering.
-   *       For now, draws a simplified placeholder with faction frame and
-   *       detection-tier-appropriate detail level.
+   * Layout (64×80 canvas):
+   *   - Frame shape occupies the top 40px (rows 4–44), proportioned wider
+   *     than tall per NATO ground-unit convention.
+   *   - NATO inner symbol (geometric glyph, no text) drawn centred inside
+   *     the frame at DETECTED / CONFIRMED tier.
+   *   - Unit class abbreviation + type ID drawn as labels in rows 46–72,
+   *     BELOW the frame — never inside it.
+   *   - SUSPECTED tier: faction-coloured blip with "?" only, no frame.
+   *   - LOST tier: dashed frame at 40% opacity, no inner symbol.
    */
   private _renderIconCanvas(descriptor: IconDescriptor): HTMLCanvasElement {
     const canvas = document.createElement('canvas');
-    canvas.width = ICON_SIZE;
-    canvas.height = ICON_SIZE;
+    canvas.width = ICON_W;
+    canvas.height = ICON_H;
     const ctx = canvas.getContext('2d')!;
 
     const colors = FACTION_COLORS[descriptor.faction === 'unknown' ? 'unknown' : descriptor.faction];
     const frameShape = factionToFrameShape(descriptor.faction);
 
-    // Clear
-    ctx.clearRect(0, 0, ICON_SIZE, ICON_SIZE);
+    ctx.clearRect(0, 0, ICON_W, ICON_H);
 
-    const cx = ICON_SIZE / 2;
-    const cy = ICON_SIZE / 2;
-    const halfSize = ICON_SIZE * 0.35;
+    // Frame occupies the top portion of the canvas.
+    const fX = 3, fY = 4, fW = ICON_W - 6, fH = 38;
+    const cx = fX + fW / 2;
+    const cy = fY + fH / 2;
 
-    // --- Draw frame shape ---
+    // ---- SUSPECTED: small pulsing blip, no frame ----
+    if (descriptor.detectionTier === 'SUSPECTED') {
+      ctx.beginPath();
+      ctx.arc(ICON_W / 2, fY + fH / 2, 9, 0, Math.PI * 2);
+      ctx.fillStyle = colors.fill;
+      ctx.fill();
+      ctx.strokeStyle = colors.frame;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('?', ICON_W / 2, fY + fH / 2);
+      return canvas;
+    }
+
+    // ---- LOST: dashed frame, faded, no inner symbol ----
+    if (descriptor.detectionTier === 'LOST') {
+      ctx.globalAlpha = 0.4;
+      ctx.setLineDash([4, 4]);
+      this._drawFrameShape(ctx, frameShape, cx, cy, fX, fY, fW, fH);
+      ctx.strokeStyle = colors.frame;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1.0;
+      return canvas;
+    }
+
+    // ---- DETECTED / CONFIRMED: solid frame + inner symbol + labels ----
+
+    // Frame fill: near-black with faction tint — DRONECOM "war room" look
+    this._drawFrameShape(ctx, frameShape, cx, cy, fX, fY, fW, fH);
+    ctx.fillStyle = '#080C14';
+    ctx.fill();
+    ctx.strokeStyle = colors.frame;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // Inner NATO symbol (geometric glyph, white)
+    this._drawNATOInnerSymbol(ctx, cx, cy, fH * 0.42, descriptor.unitClass);
+
+    // Labels below the frame (CONFIRMED only)
+    if (descriptor.detectionTier === 'CONFIRMED') {
+      const labelY = fY + fH + 5;
+      ctx.textAlign = 'center';
+
+      // Unit class abbreviation — bright, easy to read
+      ctx.font = 'bold 10px monospace';
+      ctx.fillStyle = '#C8D8E8';
+      ctx.textBaseline = 'top';
+      ctx.fillText(this._unitClassAbbreviation(descriptor.unitClass), cx, labelY);
+
+      // Type ID — dimmer, faction colour
+      ctx.font = '8px monospace';
+      ctx.fillStyle = colors.frame;
+      ctx.fillText(descriptor.unitTypeId.replace(/_/g, ' ').substring(0, 10), cx, labelY + 12);
+    }
+
+    return canvas;
+  }
+
+  /**
+   * Traces the faction frame shape path (no fill or stroke — caller applies those).
+   */
+  private _drawFrameShape(
+    ctx: CanvasRenderingContext2D,
+    shape: FrameShape,
+    cx: number, cy: number,
+    fX: number, fY: number, fW: number, fH: number,
+  ): void {
+    const r = Math.min(fW, fH) / 2;
     ctx.beginPath();
-    switch (frameShape) {
+    switch (shape) {
       case 'rectangle':
-        ctx.rect(cx - halfSize, cy - halfSize * 0.7, halfSize * 2, halfSize * 1.4);
+        ctx.rect(fX, fY, fW, fH);
         break;
       case 'diamond':
-        ctx.moveTo(cx, cy - halfSize);
-        ctx.lineTo(cx + halfSize, cy);
-        ctx.lineTo(cx, cy + halfSize);
-        ctx.lineTo(cx - halfSize, cy);
+        ctx.moveTo(cx,        fY);
+        ctx.lineTo(fX + fW,  cy);
+        ctx.lineTo(cx,        fY + fH);
+        ctx.lineTo(fX,        cy);
         ctx.closePath();
         break;
       case 'hexagon':
         for (let i = 0; i < 6; i++) {
-          const angle = (Math.PI / 3) * i - Math.PI / 6;
-          const px = cx + halfSize * Math.cos(angle);
-          const py = cy + halfSize * Math.sin(angle);
-          if (i === 0) ctx.moveTo(px, py);
-          else ctx.lineTo(px, py);
+          const a = (Math.PI / 3) * i - Math.PI / 6;
+          const px = cx + r * Math.cos(a);
+          const py = cy + r * Math.sin(a);
+          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
         }
         ctx.closePath();
         break;
-      case 'quatrefoil':
-        // Simplified quatrefoil as rounded diamond
+      case 'quatrefoil': {
+        const qr = r * 0.9;
         for (let i = 0; i < 4; i++) {
-          const angle = (Math.PI / 2) * i;
-          const px = cx + halfSize * 0.9 * Math.cos(angle);
-          const py = cy + halfSize * 0.9 * Math.sin(angle);
+          const a = (Math.PI / 2) * i;
+          const px = cx + qr * Math.cos(a);
+          const py = cy + qr * Math.sin(a);
           ctx.quadraticCurveTo(
-            cx + halfSize * 0.5 * Math.cos(angle + Math.PI / 4),
-            cy + halfSize * 0.5 * Math.sin(angle + Math.PI / 4),
+            cx + qr * 0.55 * Math.cos(a + Math.PI / 4),
+            cy + qr * 0.55 * Math.sin(a + Math.PI / 4),
             px, py,
           );
         }
         ctx.closePath();
         break;
+      }
     }
+  }
 
-    ctx.fillStyle = colors.fill;
-    ctx.fill();
-    ctx.strokeStyle = colors.frame;
+  /**
+   * Draws the NATO inner glyph centred at (cx, cy).
+   * Uses purely geometric shapes — no text — matching the DRONECOM aesthetic.
+   *
+   * Glyph key:
+   *   Armor (MBT/IFV/APC/AT/AA vehicle) — diagonal line, bottom-left → top-right
+   *   Infantry variants                  — × (crossed diagonals)
+   *   Artillery / mortar                 — circle outline
+   *   Scout                              — small filled circle (dot)
+   *   HQ                                 — filled diamond pip
+   *   Helicopters                        — two arcs (rotor blades)
+   *   Fixed wing                         — wide chevron arc
+   *   Support / supply                   — horizontal dash
+   */
+  private _drawNATOInnerSymbol(
+    ctx: CanvasRenderingContext2D,
+    cx: number, cy: number,
+    size: number,
+    unitClass: UnitClass,
+  ): void {
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.fillStyle = '#FFFFFF';
     ctx.lineWidth = 2;
-    ctx.stroke();
+    ctx.lineCap = 'round';
 
-    // --- Draw detection-tier-appropriate content inside the frame ---
-    ctx.fillStyle = colors.frame;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-
-    switch (descriptor.detectionTier) {
-      case 'SUSPECTED':
-        // Faction blip with "?" symbol — position jitter handled by UnitManager
-        ctx.font = 'bold 24px monospace';
-        ctx.fillText('?', cx, cy);
+    switch (unitClass) {
+      case 'mbt':
+      case 'ifv':
+      case 'apc':
+      case 'at_vehicle':
+      case 'aa_vehicle':
+        // Armor: diagonal line, bottom-left to top-right
+        ctx.beginPath();
+        ctx.moveTo(cx - size * 0.55, cy + size * 0.45);
+        ctx.lineTo(cx + size * 0.55, cy - size * 0.45);
+        ctx.stroke();
         break;
 
-      case 'DETECTED':
-        // Frame + category abbreviation (e.g. "MBT", "INF")
-        ctx.font = 'bold 12px monospace';
-        ctx.fillText(
-          this._unitClassAbbreviation(descriptor.unitClass),
-          cx,
-          cy,
-        );
+      case 'infantry':
+      case 'at_infantry':
+      case 'aa_infantry':
+      case 'engineer':
+      case 'sniper':
+        // Infantry: × (two crossing diagonals)
+        ctx.beginPath();
+        ctx.moveTo(cx - size * 0.38, cy - size * 0.38);
+        ctx.lineTo(cx + size * 0.38, cy + size * 0.38);
+        ctx.moveTo(cx + size * 0.38, cy - size * 0.38);
+        ctx.lineTo(cx - size * 0.38, cy + size * 0.38);
+        ctx.stroke();
         break;
 
-      case 'CONFIRMED':
-        // Frame + full type glyph with designation
-        // TODO: Use milsymbol SIDC code to render proper APP-6 symbol glyph
-        ctx.font = 'bold 11px monospace';
-        ctx.fillText(
-          this._unitClassAbbreviation(descriptor.unitClass),
-          cx,
-          cy - 4,
-        );
-        ctx.font = '8px monospace';
-        ctx.fillText(descriptor.unitTypeId.substring(0, 6), cx, cy + 10);
+      case 'arty_sp':
+      case 'arty_towed':
+      case 'mortar':
+        // Artillery: circle outline
+        ctx.beginPath();
+        ctx.arc(cx, cy, size * 0.38, 0, Math.PI * 2);
+        ctx.stroke();
         break;
 
-      case 'LOST':
-        // Faded frame with "X" or last known designation
-        ctx.globalAlpha = 0.4;
-        ctx.font = 'bold 18px monospace';
-        ctx.fillText('X', cx, cy);
-        ctx.globalAlpha = 1.0;
+      case 'scout':
+        // Scout: small filled dot
+        ctx.beginPath();
+        ctx.arc(cx, cy, size * 0.22, 0, Math.PI * 2);
+        ctx.fill();
+        break;
+
+      case 'hq':
+        // HQ: small filled diamond pip
+        ctx.beginPath();
+        ctx.moveTo(cx,           cy - size * 0.38);
+        ctx.lineTo(cx + size * 0.28, cy);
+        ctx.lineTo(cx,           cy + size * 0.38);
+        ctx.lineTo(cx - size * 0.28, cy);
+        ctx.closePath();
+        ctx.fill();
+        break;
+
+      case 'helicopter_attack':
+      case 'helicopter_transport':
+        // Helicopters: two small arcs (stylised rotor)
+        ctx.beginPath();
+        ctx.arc(cx - size * 0.22, cy + size * 0.05, size * 0.28, Math.PI, 0);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(cx + size * 0.22, cy + size * 0.05, size * 0.28, Math.PI, 0);
+        ctx.stroke();
+        break;
+
+      case 'fixed_wing':
+        // Fixed wing: wide chevron arc
+        ctx.beginPath();
+        ctx.moveTo(cx - size * 0.5, cy + size * 0.15);
+        ctx.quadraticCurveTo(cx, cy - size * 0.38, cx + size * 0.5, cy + size * 0.15);
+        ctx.stroke();
+        break;
+
+      default:
+        // Support / supply / unknown: horizontal dash
+        ctx.beginPath();
+        ctx.moveTo(cx - size * 0.38, cy);
+        ctx.lineTo(cx + size * 0.38, cy);
+        ctx.stroke();
         break;
     }
-
-    return canvas;
   }
 
   /**

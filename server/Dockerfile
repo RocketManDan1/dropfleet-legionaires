@@ -7,6 +7,8 @@ RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY shared/ ./shared/
 COPY server/ ./server/
+COPY ["New Direction Docs/", "./New Direction Docs/"]
+COPY ["Unit Testing/", "./Unit Testing/"]
 
 RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @legionaires/shared build

@@ -21,6 +21,7 @@ import {
 } from '@legionaires/shared';
 
 import type { TerrainData } from '../game/session.js';
+import type { UnitRegistry } from '../data/unit-registry.js';
 
 // ---------------------------------------------------------------------------
 // Movement mode multiplier lookup
@@ -133,8 +134,9 @@ function getTerrainCost(
   const grid = costGrids.get(moveClass);
   if (!grid) return 1.0;
 
-  const col = Math.floor(x / grid.cellSizeM);
-  const row = Math.floor(z / grid.cellSizeM);
+  // posX/posZ are cell indices, not metres — no division needed
+  const col = Math.floor(x);
+  const row = Math.floor(z);
 
   // Bounds check
   if (col < 0 || col >= grid.width || row < 0 || row >= grid.height) return 1.0;
@@ -171,6 +173,7 @@ export function resolveMovement(
   dt: number,
   terrain: TerrainData,
   costGrids: Map<MoveClass, CostGrid> | null,
+  unitTypes?: UnitRegistry | null,
 ): void {
   for (const [unitId, unit] of units) {
     // Skip dead, surrendered, or frozen units
@@ -227,15 +230,17 @@ export function resolveMovement(
     const unitPos: Vec2 = { x: unit.posX, z: unit.posZ };
 
     // --- Compute effective speed at current position ---
-    // TODO: Look up moveClass from UnitType (requires UnitRegistry access)
-    const moveClass: MoveClass = 'track'; // TODO: Replace with actual unit move class
+    const ut = unitTypes?.get(unit.unitTypeId);
+    const moveClass: MoveClass = ut?.moveClass ?? 'track';
     const cellCost = getTerrainCost(costGrids, moveClass, unit.posX, unit.posZ);
-    const maxSpeedM = 10; // TODO: Replace with UnitType.maxSpeedM lookup
+    const maxSpeedM = ut?.maxSpeedM ?? 10;
     const speed = effectiveSpeed(maxSpeedM, unit.moveMode, cellCost);
 
     // --- Move toward waypoint ---
+    // speed is in m/s; convert to cells/sec using terrain resolution (m/cell)
+    const speedCellsPerSec = speed / terrain.resolution;
     const distToWaypoint = distanceBetween(unitPos, waypoint);
-    const stepDistance = speed * dt;
+    const stepDistance = speedCellsPerSec * dt;
 
     if (stepDistance >= distToWaypoint) {
       // Arrived at waypoint — snap to it and advance index

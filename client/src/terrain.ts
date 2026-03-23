@@ -23,6 +23,7 @@ export interface TerrainData {
   mountainWeightMap?: number[];
   hillWeightMap?: number[];
   flatlandWeightMap?: number[];
+  terrainTypeMap?: number[];
   towns?: TownAnchor[];
   seaLevel: number;
   biome?: string;

@@ -3,7 +3,7 @@
 // Source: SERVER_GAME_LOOP.md — 9 phases in strict single-threaded order
 // Milestone 2 scaffold
 // ============================================================================
-import { TICK_RATE_HZ, TICK_MS, TICKS_PER_SEC, AI_STRATEGIC_UPDATE_TICKS, AI_PLATOON_BT_TICKS, } from '@legionaires/shared';
+import { TICK_RATE_HZ, TICK_MS, TICKS_PER_SEC, AI_STRATEGIC_UPDATE_TICKS, AI_PLATOON_BT_TICKS, MAX_QUEUED_WAYPOINTS, } from '@legionaires/shared';
 import { resolveMovement } from '../systems/movement.js';
 import { updateSpotting } from '../systems/spotting.js';
 import { resolveFire } from '../systems/fire.js';
@@ -112,7 +112,7 @@ export class TickLoop {
         if (this.state !== 'RUNNING')
             return;
         const tickStart = performance.now();
-        const isSecondTick = this.tick % TICKS_PER_SEC === 0;
+        const isSecondTick = this.tick > 0 && this.tick % TICKS_PER_SEC === 0;
         const dt = 1 / TICK_RATE_HZ; // 0.05 seconds per tick
         // Clear the intra-tick event buffer
         this.tickEvents = [];
@@ -120,7 +120,14 @@ export class TickLoop {
         const units = this.session.getUnitRegistry();
         const terrain = this.session.getTerrain();
         const spatialHash = this.session.getSpatialHash();
-        const missionState = this.session.getMissionState();
+        for (const [, unit] of units) {
+            unit.firedThisTick = false;
+            for (let i = 0; i < unit.weaponCooldowns.length; i++) {
+                if (unit.weaponCooldowns[i] > 0) {
+                    unit.weaponCooldowns[i] -= 1;
+                }
+            }
+        }
         // -----------------------------------------------------------------------
         // Phase 1: Input Processing — every tick
         // Read inbound order queue, validate, write to per-unit order state
@@ -191,6 +198,7 @@ export class TickLoop {
             this.phaseBroadcast();
         }
         this.lastTimings.broadcastMs = performance.now() - p9Start;
+        this.session.checkDisconnectTimers(this.tick);
         // -----------------------------------------------------------------------
         // Advance tick counter and measure total
         // -----------------------------------------------------------------------
@@ -216,12 +224,35 @@ export class TickLoop {
             // Drain the inbound order buffer for this player
             const pendingOrders = playerConn.drainOrderBuffer();
             for (const orderMsg of pendingOrders) {
-                // TODO: Validate order (ownership, unit alive, legal for class,
-                //       contact gate, range, ammo, suppression, queue depth, C2 range)
-                //       See SERVER_GAME_LOOP.md §4 for the 10-check validation sequence.
-                // TODO: On accept — write ResolvedOrder to unit's currentOrder
-                // TODO: On reject — send ORDER_ACK with status: 'REJECTED' and reason
-                // TODO: On accept — send ORDER_ACK with status: 'ACCEPTED'
+                const unitId = orderMsg.unitId;
+                if (!unitId) {
+                    continue;
+                }
+                const unit = this.session.getUnitRegistry().get(unitId);
+                if (!unit || unit.ownerId !== playerId || unit.isDestroyed) {
+                    continue;
+                }
+                if (orderMsg.type === 'move' || orderMsg.type === 'move_fast' || orderMsg.type === 'reverse') {
+                    if (orderMsg.targetPos) {
+                        const moveMode = orderMsg.type === 'move_fast'
+                            ? 'march'
+                            : orderMsg.type === 'reverse'
+                                ? 'reverse'
+                                : 'advance';
+                        if (unit.orderQueue.length < MAX_QUEUED_WAYPOINTS) {
+                            unit.orderQueue.push({ pos: orderMsg.targetPos, moveMode });
+                        }
+                        if (!unit.currentOrder) {
+                            unit.currentOrder = {
+                                type: 'move',
+                                targetPos: orderMsg.targetPos,
+                                moveMode,
+                            };
+                        }
+                    }
+                    continue;
+                }
+                unit.currentOrder = orderMsg;
             }
         }
     }
@@ -245,17 +276,37 @@ export class TickLoop {
         // --- Player order propagation ---
         const units = this.session.getUnitRegistry();
         for (const [unitId, unit] of units) {
+            void unitId;
             if (unit.isDestroyed)
                 continue;
             if (!unit.currentOrder)
                 continue;
-            // TODO: Translate ResolvedOrder into unit intent fields:
-            //   - MOVE orders: compute A* path, set currentPath/pathIndex
-            //   - ENGAGE orders: set currentTargetId, engageSlotOverride
-            //   - SET_POSTURE: update firePosture
-            //   - RALLY: apply -15 suppression with cooldown check
-            //   - CANCEL: clear path queue, halt unit
-            //   - Shift-queued moves: append to orderQueue (max 4)
+            if (unit.currentOrder.type === 'set_posture' && unit.currentOrder.posture) {
+                unit.firePosture = unit.currentOrder.posture;
+                unit.currentOrder = null;
+                continue;
+            }
+            if (unit.currentOrder.type === 'cancel') {
+                unit.currentPath = null;
+                unit.pathIndex = 0;
+                unit.orderQueue.length = 0;
+                unit.currentTargetId = null;
+                unit.currentOrder = null;
+                continue;
+            }
+            if (unit.currentOrder.type === 'engage' || unit.currentOrder.type === 'area_fire') {
+                unit.currentTargetId = unit.currentOrder.targetUnitId ?? null;
+                unit.engageSlotOverride = unit.currentOrder.weaponSlot ?? null;
+            }
+            if (unit.currentOrder.type === 'move' && unit.currentOrder.targetPos) {
+                unit.currentPath = [
+                    { x: unit.posX, z: unit.posZ },
+                    unit.currentOrder.targetPos,
+                ];
+                unit.pathIndex = 1;
+                unit.moveMode = unit.currentOrder.moveMode ?? 'advance';
+            }
+            unit.currentOrder = null;
         }
     }
     /**
@@ -266,11 +317,10 @@ export class TickLoop {
         const units = this.session.getUnitRegistry();
         const terrain = this.session.getTerrain();
         const spatialHash = this.session.getSpatialHash();
-        // TODO: Build or retrieve cost grids (one per MoveClass, built at mission start)
-        const costGrids = null; // TODO: Replace with real cost grid map
-        resolveMovement(units, dt, terrain, costGrids);
+        const costGrids = this.session.getCostGrids();
+        resolveMovement(units, dt, terrain, costGrids, this.session.getUnitTypeRegistry());
         // After positions change, update the spatial hash
-        // TODO: spatialHash.rebuildFromUnits(units);
+        spatialHash.rebuildFromUnits(units);
     }
     /**
      * Phase 4: Spotting Updates — runs every second.
@@ -281,7 +331,7 @@ export class TickLoop {
         const contacts = this.session.getContactMap();
         const spatialHash = this.session.getSpatialHash();
         const terrain = this.session.getTerrain();
-        updateSpotting(units, contacts, spatialHash, terrain);
+        updateSpotting(units, contacts, spatialHash, terrain, this.tick, this.session.getUnitTypeRegistry());
     }
     /**
      * Phase 5: Fire Resolution — runs every tick.
@@ -306,7 +356,7 @@ export class TickLoop {
                 });
             }
         }
-        const fireResult = resolveFire(units, contacts, fireOrders, dt);
+        const fireResult = resolveFire(units, contacts, fireOrders, this.tick, this.session.getUnitTypeRegistry());
         // Store shot records on the session for Phase 6
         this.session.setPendingShotRecords(fireResult.shotRecords);
         // Emit shot-fired events for the intra-tick bus
@@ -326,7 +376,8 @@ export class TickLoop {
         if (shotRecords.length === 0)
             return;
         const units = this.session.getUnitRegistry();
-        const damagePhaseResult = applyDamage(shotRecords, units, this.tick);
+        const unitTypes = this.session.getUnitTypeRegistry();
+        const damagePhaseResult = applyDamage(shotRecords, units, this.tick, unitTypes);
         // Emit destruction and impact events for Phase 7 (suppression)
         for (const result of damagePhaseResult.damageResults) {
             this.tickEvents.push({
@@ -364,7 +415,7 @@ export class TickLoop {
             isNearMiss: false,
             nearMissDistanceM: 0,
         }));
-        updateSuppression(units, impacts, dt, isSecondTick);
+        updateSuppression(units, impacts, this.tick, isSecondTick);
     }
     /**
      * Phase 8: Supply Tick — runs every second.
@@ -373,7 +424,7 @@ export class TickLoop {
     phaseSupplyTick(dt) {
         const units = this.session.getUnitRegistry();
         const spatialHash = this.session.getSpatialHash();
-        tickSupply(units, spatialHash, dt);
+        tickSupply(units, spatialHash, dt, this.session.getUnitTypeRegistry());
     }
     /**
      * Phase 9: State Broadcast — runs every second.

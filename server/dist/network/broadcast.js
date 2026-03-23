@@ -6,6 +6,7 @@
 // Runs every second (tick % 20 === 0). Game events are sent immediately.
 // Target: < 5 KB/s per player during steady-state.
 // ============================================================================
+import { serializeServerMessage } from './protocol.js';
 /**
  * Compute unit deltas by comparing current state to previous broadcast.
  * Only include fields that have changed.
@@ -100,6 +101,83 @@ export function buildTickUpdate(unitDeltas, contactDeltas, events, tick, mission
         events,
     };
 }
+const previousContactsBySession = new WeakMap();
+function cloneContactState(contacts) {
+    const perPlayer = new Map();
+    for (const [playerId, contactMap] of contacts) {
+        const values = new Map();
+        for (const [contactId, entry] of contactMap) {
+            values.set(contactId, entry.detectionValue);
+        }
+        perPlayer.set(playerId, values);
+    }
+    return perPlayer;
+}
+function computeContactDeltas(playerContacts, previousPlayerContacts) {
+    const deltas = [];
+    for (const [contactId, contact] of playerContacts) {
+        if (contact.detectionValue <= 0)
+            continue;
+        const prev = previousPlayerContacts?.get(contactId);
+        deltas.push({
+            contactId,
+            action: prev === undefined ? 'add' : 'update',
+            tier: contact.detectionValue,
+            tierLabel: contact.detectionTier === 'LOST' ? 'SUSPECTED' : contact.detectionTier,
+            posX: contact.estimatedPos.x,
+            posZ: contact.estimatedPos.z,
+            unitClass: contact.estimatedCategory ?? undefined,
+            lastSeenTick: contact.lastSeenTick,
+        });
+    }
+    if (previousPlayerContacts) {
+        for (const [contactId] of previousPlayerContacts) {
+            if (!playerContacts.has(contactId)) {
+                deltas.push({
+                    contactId,
+                    action: 'remove',
+                });
+            }
+        }
+    }
+    return deltas;
+}
+function mapTickEventsToGameEvents(tickEvents) {
+    const events = [];
+    for (const event of tickEvents) {
+        const typed = event;
+        if (!typed.type || !typed.data)
+            continue;
+        if (typed.type === 'SHOT_FIRED') {
+            events.push({
+                type: 'shot_fired',
+                firerId: String(typed.data.firerId ?? ''),
+                targetId: String(typed.data.targetId ?? ''),
+                weaponSlot: Number(typed.data.weaponSlot ?? 0),
+                fromPos: { x: 0, z: 0 },
+                toPos: { x: 0, z: 0 },
+            });
+        }
+        if (typed.type === 'SHOT_IMPACT') {
+            events.push({
+                type: 'shot_impact',
+                targetId: String(typed.data.targetId ?? ''),
+                pos: { x: 0, z: 0 },
+                penetrated: Boolean(typed.data.penetrated),
+                damage: Number(typed.data.damage ?? 0),
+            });
+        }
+        if (typed.type === 'UNIT_DESTROYED') {
+            events.push({
+                type: 'unit_destroyed',
+                unitId: String(typed.data.unitId ?? ''),
+                killerUnitId: '',
+                pos: { x: 0, z: 0 },
+            });
+        }
+    }
+    return events;
+}
 /**
  * Broadcast current game state delta to all connected players.
  * Milestone 2 stub — full fog-of-war filtering and compression added there.
@@ -109,7 +187,58 @@ export function buildTickUpdate(unitDeltas, contactDeltas, events, tick, mission
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function broadcastGameState(_session, _tickEvents, _tick) {
-    // TODO (Milestone 2): Iterate session.getConnectedPlayers(), compute per-player
-    // unit/contact deltas, build TickUpdatePayload, serialise and send.
-    // For now, no-op — M1 uses direct WS messages in index.ts.
+    const session = _session;
+    const units = session.getUnitRegistry();
+    const contacts = session.getContactMap();
+    const connectedPlayers = session.getConnectedPlayers();
+    const previousUnits = session.getPreviousBroadcastState();
+    const previousUnitSnapshot = {
+        unitStates: new Map([...previousUnits.entries()].map(([unitId, prev]) => [
+            unitId,
+            {
+                posX: prev.posX ?? 0,
+                posZ: prev.posZ ?? 0,
+                heading: prev.heading ?? 0,
+                crewCurrent: prev.crewCurrent ?? 0,
+                suppressionLevel: prev.suppressionLevel ?? 0,
+                moraleState: String(prev.moraleState ?? 'normal'),
+                speedState: String(prev.speedState ?? 'full_halt'),
+                isDestroyed: Boolean(prev.isDestroyed),
+            },
+        ])),
+        tick: _tick,
+    };
+    const previousContacts = previousContactsBySession.get(_session) ?? new Map();
+    const gameEvents = mapTickEventsToGameEvents(_tickEvents);
+    for (const player of connectedPlayers) {
+        const unitDeltas = computeUnitDeltas(units, previousUnitSnapshot, player.playerId);
+        const playerContacts = contacts.get(player.playerId) ?? new Map();
+        const contactDeltas = computeContactDeltas(playerContacts, previousContacts.get(player.playerId));
+        const payload = buildTickUpdate(unitDeltas, contactDeltas, gameEvents, _tick, _tick / 20);
+        const wireMessage = serializeServerMessage({ type: 'TICK_UPDATE', payload }, _tick);
+        try {
+            const socket = player.ws;
+            if (socket.readyState === 1 && socket.send) {
+                socket.send(wireMessage);
+            }
+        }
+        catch {
+            // Ignore transient socket errors; disconnect lifecycle is handled elsewhere.
+        }
+    }
+    const newPrev = new Map();
+    for (const [unitId, unit] of units) {
+        newPrev.set(unitId, {
+            posX: unit.posX,
+            posZ: unit.posZ,
+            heading: unit.heading,
+            crewCurrent: unit.crewCurrent,
+            suppressionLevel: unit.suppressionLevel,
+            moraleState: unit.moraleState,
+            speedState: unit.speedState,
+            isDestroyed: unit.isDestroyed,
+        });
+    }
+    session.setPreviousBroadcastState(newPrev);
+    previousContactsBySession.set(_session, cloneContactState(contacts));
 }

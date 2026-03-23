@@ -14,6 +14,7 @@ import type {
 import {
   TIER_DETECTED_MIN,
 } from '@legionaires/shared';
+import type { UnitRegistry } from '../data/unit-registry.js';
 
 // --- Inputs and outputs ---
 
@@ -40,6 +41,7 @@ export function resolveFire(
   contacts: Map<string, Map<string, ContactEntry>>,
   playerFireOrders: FireOrder[],
   tick: number,
+  unitTypes?: UnitRegistry | null,
 ): FirePhaseResult {
   const shotRecords: ShotRecord[] = [];
   const rejectedOrders: Array<{ unitId: string; reason: string }> = [];
@@ -53,7 +55,7 @@ export function resolveFire(
     const target = selectAutoFireTarget(unit, units, contacts);
     if (!target) continue;
 
-    const shot = attemptFire(unit, target, units, contacts, tick);
+    const shot = attemptFire(unit, target, units, contacts, tick, undefined, unitTypes ?? null);
     if (shot) {
       shotRecords.push(shot);
       unit.firedThisTick = true;
@@ -80,7 +82,7 @@ export function resolveFire(
       continue;
     }
 
-    const shot = attemptFire(unit, targetUnit, units, contacts, tick, order.weaponSlot);
+    const shot = attemptFire(unit, targetUnit, units, contacts, tick, order.weaponSlot, unitTypes ?? null);
     if (shot) {
       shotRecords.push(shot);
       unit.firedThisTick = true;
@@ -101,6 +103,7 @@ function attemptFire(
   contacts: Map<string, Map<string, ContactEntry>>,
   tick: number,
   preferredSlot?: number,
+  unitTypes?: UnitRegistry | null,
 ): ShotRecord | null {
   // 1. DETECTED gate: firer must have target at DETECTED+ in own accumulator
   const firerContacts = contacts.get(firer.ownerId);
@@ -120,8 +123,10 @@ function attemptFire(
 
   // 5. Check range
   const range = distance(firer, target);
-  // TODO: get weapon maxRange from UnitType registry lookup
-  // if (range > weapon.rangeM) return null;
+  const firerType = unitTypes?.get(firer.unitTypeId);
+  const weapon = firerType?.weapons[slot] ?? null;
+  const weaponMaxRange = weapon?.rangeM ?? 2000;
+  if (range > weaponMaxRange) return null;
 
   // 6. Check suppression threshold
   if (firer.suppressionLevel >= 40 && firer.moraleState === 'pinned') return null;
@@ -130,7 +135,12 @@ function attemptFire(
   const ammoType = selectAmmoType(ammo, target);
 
   // 8. Consume ammo and apply cooldown
-  // TODO: decrement ammo[slot][ammoType], set cooldown from weapon ROF
+  if (ammoType === 'HE') ammo.he = Math.max(0, ammo.he - 1);
+  if (ammoType === 'AP') ammo.ap = Math.max(0, ammo.ap - 1);
+  if (ammoType === 'HEAT') ammo.heat = Math.max(0, ammo.heat - 1);
+  if (ammoType === 'Sabot') ammo.sabot = Math.max(0, ammo.sabot - 1);
+  firer.weaponCooldowns[slot] = 10;
+  firer.lastFireTick = tick;
 
   // 9. Build shot record
   return {
@@ -150,23 +160,50 @@ function attemptFire(
 
 function selectAutoFireTarget(
   firer: UnitInstance,
-  _units: Map<string, UnitInstance>,
-  _contacts: Map<string, Map<string, ContactEntry>>,
+  units: Map<string, UnitInstance>,
+  contacts: Map<string, Map<string, ContactEntry>>,
 ): UnitInstance | null {
-  // TODO: Select highest-priority DETECTED+ enemy within weapon range
-  // Priority: closest threat, then highest value
-  return null;
+  const firerContacts = contacts.get(firer.ownerId);
+  if (!firerContacts) return null;
+
+  let best: UnitInstance | null = null;
+  let bestRange = Number.POSITIVE_INFINITY;
+
+  for (const [contactId, contact] of firerContacts) {
+    if (contact.detectionValue < TIER_DETECTED_MIN) continue;
+    const target = units.get(contactId);
+    if (!target || target.isDestroyed || target.ownerId === firer.ownerId) continue;
+    const range = distance(firer, target);
+    if (range < bestRange) {
+      best = target;
+      bestRange = range;
+    }
+  }
+
+  return best;
 }
 
 // --- Helper: weapon slot selection ---
 
 function selectBestWeaponSlot(
-  _firer: UnitInstance,
-  _target: UnitInstance,
+  firer: UnitInstance,
+  target: UnitInstance,
 ): number | null {
-  // TODO: Select slot with ammo, in range, best damage vs target type
-  // Prefer AP/Sabot vs armoured, HE vs infantry
-  return 0;
+  const targetLooksArmored = target.steelArmour.hullFront > 20 || target.steelArmour.turretFront > 20;
+  const preferredOrder = targetLooksArmored
+    ? (['sabot', 'ap', 'heat', 'he'] as const)
+    : (['he', 'ap', 'heat', 'sabot'] as const);
+
+  for (const ammoType of preferredOrder) {
+    for (let slot = 0; slot < firer.ammo.length; slot++) {
+      const ammo = firer.ammo[slot];
+      if (!ammo) continue;
+      if (firer.weaponCooldowns[slot] > 0) continue;
+      if (ammo[ammoType] > 0) return slot;
+    }
+  }
+
+  return null;
 }
 
 // --- Helper: ammo type selection ---

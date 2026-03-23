@@ -3,9 +3,10 @@
 // Source: SERVER_GAME_LOOP.md §6 (GameSession interface)
 // Milestone 2 scaffold
 // ============================================================================
-import { DISCONNECT_GRACE_TICKS, TICKS_PER_SEC, } from '@legionaires/shared';
+import { DISCONNECT_GRACE_TICKS, TICKS_PER_SEC, IMPASSABLE_THRESHOLD, } from '@legionaires/shared';
 import { TickLoop } from './tick-loop.js';
 import { SpatialHash } from './spatial-hash.js';
+import { TERRAIN_MOVE_COST } from '../terrain-types.js';
 /**
  * Create a default PlayerConnection for a newly joining player.
  */
@@ -59,6 +60,7 @@ export class GameSession {
     spatialHash;
     terrain;
     scenario;
+    unitTypes;
     // --- Unit state -----------------------------------------------------------
     unitRegistry = new Map();
     // --- Player connections ---------------------------------------------------
@@ -86,21 +88,64 @@ export class GameSession {
     // --- Transient per-tick data (set by tick phases, consumed later) ----------
     pendingShotRecords = [];
     pendingDamageResults = [];
+    // --- Cost grids (one per MoveClass, built at session creation) ------------
+    costGrids = new Map();
     // --- Lifecycle timestamps -------------------------------------------------
     createdAt;
     missionStartTick = 0;
     lastSnapshotTick = 0;
     // --- Previous broadcast state (for delta computation) ---------------------
     previousBroadcastState = new Map();
-    constructor(sessionId, terrain, scenario) {
+    constructor(sessionId, terrain, scenario, unitTypes = null) {
         this.sessionId = sessionId;
         this.terrain = terrain;
         this.scenario = scenario;
+        this.unitTypes = unitTypes;
         this.createdAt = Date.now();
         // Initialize spatial hash with map dimensions
-        this.spatialHash = new SpatialHash(terrain.widthM, terrain.heightM);
+        this.spatialHash = new SpatialHash(terrain.width, terrain.height);
+        // Build cost grids (one per ground MoveClass)
+        this.buildCostGrids();
         // Create the tick loop, passing this session as the data source
         this.tickLoop = new TickLoop(this);
+    }
+    // =========================================================================
+    // Cost grids
+    // =========================================================================
+    /**
+     * Build a cost grid for each ground MoveClass from the terrain type map and
+     * slope map. Air units always cost 1.0 so they get a flat grid.
+     *
+     * Cost = terrainTypeCost × (1 + slopePenalty)
+     *   slopePenalty = slope / IMPASSABLE_THRESHOLD (capped at 1.0)
+     *   If terrainTypeCost >= 90 OR slope >= IMPASSABLE_THRESHOLD → cell = 99 (impassable)
+     */
+    buildCostGrids() {
+        const { width, height, resolution, terrainTypeMap, slopeMap } = this.terrain;
+        const moveClasses = ['track', 'wheel', 'leg', 'hover'];
+        for (const mc of moveClasses) {
+            const data = new Float32Array(width * height);
+            for (let i = 0; i < width * height; i++) {
+                const tt = terrainTypeMap[i];
+                const cost = TERRAIN_MOVE_COST[tt]?.[mc] ?? 1.0;
+                const slope = slopeMap[i] ?? 0;
+                if (cost >= IMPASSABLE_THRESHOLD || slope >= IMPASSABLE_THRESHOLD) {
+                    data[i] = 99;
+                }
+                else {
+                    const slopePenalty = Math.min(slope / IMPASSABLE_THRESHOLD, 1.0);
+                    data[i] = cost * (1 + slopePenalty);
+                }
+            }
+            this.costGrids.set(mc, { data, width, height, cellSizeM: resolution });
+        }
+        // Air: flat cost 1.0 everywhere
+        const airData = new Float32Array(width * height).fill(1.0);
+        this.costGrids.set('air', { data: airData, width, height, cellSizeM: resolution });
+    }
+    /** Get the cost grids map (one per MoveClass). */
+    getCostGrids() {
+        return this.costGrids;
     }
     // =========================================================================
     // Player management
@@ -220,6 +265,12 @@ export class GameSession {
     }
     getPlayers() {
         return this.players;
+    }
+    getConnectedPlayers() {
+        return [...this.players.values()].filter((p) => p.isConnected);
+    }
+    getUnitTypeRegistry() {
+        return this.unitTypes;
     }
     getContactMap() {
         return this.contacts;
