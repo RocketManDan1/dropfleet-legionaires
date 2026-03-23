@@ -134,9 +134,8 @@ function getTerrainCost(
   const grid = costGrids.get(moveClass);
   if (!grid) return 1.0;
 
-  // posX/posZ are cell indices, not metres — no division needed
-  const col = Math.floor(x);
-  const row = Math.floor(z);
+  const col = Math.floor(x / grid.cellSizeM);
+  const row = Math.floor(z / grid.cellSizeM);
 
   // Bounds check
   if (col < 0 || col >= grid.width || row < 0 || row >= grid.height) return 1.0;
@@ -237,10 +236,11 @@ export function resolveMovement(
     const speed = effectiveSpeed(maxSpeedM, unit.moveMode, cellCost);
 
     // --- Move toward waypoint ---
-    // speed is in m/s; convert to cells/sec using terrain resolution (m/cell)
-    const speedCellsPerSec = speed / terrain.resolution;
+    // Positions are cell indices. CELL_REAL_M converts m/s → cells/sec.
+    // 1 cell = 20 real-world metres, so 10 m/s = 0.5 cells/sec.
+    const CELL_REAL_M = 20;
     const distToWaypoint = distanceBetween(unitPos, waypoint);
-    const stepDistance = speedCellsPerSec * dt;
+    const stepDistance = (speed / CELL_REAL_M) * dt;
 
     if (stepDistance >= distToWaypoint) {
       // Arrived at waypoint — snap to it and advance index

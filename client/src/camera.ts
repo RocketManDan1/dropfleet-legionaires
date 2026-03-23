@@ -36,6 +36,7 @@ export class RTSCamera {
   private dragButton = -1;
   private lastMouse = { x: 0, y: 0 };
   private mousePos = { x: 0, y: 0 };
+  private windowFocused = true;
 
   // Pan speed
   private panSpeed = 0.15;
@@ -124,6 +125,11 @@ export class RTSCamera {
   private bindEvents() {
     window.addEventListener('keydown', (e) => this.keys.add(e.code));
     window.addEventListener('keyup', (e) => this.keys.delete(e.code));
+    window.addEventListener('blur', () => {
+      this.windowFocused = false;
+      this.keys.clear(); // prevent stuck keys when alt-tabbing
+    });
+    window.addEventListener('focus', () => { this.windowFocused = true; });
 
     window.addEventListener('mousedown', (e) => {
       if (e.button === 1 || e.button === 2) { // middle or right
@@ -197,20 +203,29 @@ export class RTSCamera {
     if (this.keys.has('KeyD') || this.keys.has('ArrowRight'))
       this.target.addScaledVector(right, this.keyPanSpeed);
 
-    // Edge scrolling
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-    const ez = this.edgeScrollZone;
-    const edgeSpeed = this.keyPanSpeed * 0.8;
+    // Edge scrolling — disabled when window is not focused
+    if (this.windowFocused) {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      const ez = this.edgeScrollZone;
+      const edgeSpeed = this.keyPanSpeed * 0.8;
 
-    if (this.mousePos.x < ez)
-      this.target.addScaledVector(right, -edgeSpeed);
-    if (this.mousePos.x > w - ez)
-      this.target.addScaledVector(right, edgeSpeed);
-    if (this.mousePos.y < ez)
-      this.target.addScaledVector(forward, edgeSpeed);
-    if (this.mousePos.y > h - ez)
-      this.target.addScaledVector(forward, -edgeSpeed);
+      if (this.mousePos.x < ez)
+        this.target.addScaledVector(right, -edgeSpeed);
+      if (this.mousePos.x > w - ez)
+        this.target.addScaledVector(right, edgeSpeed);
+      if (this.mousePos.y < ez)
+        this.target.addScaledVector(forward, edgeSpeed);
+      if (this.mousePos.y > h - ez)
+        this.target.addScaledVector(forward, -edgeSpeed);
+    }
+
+    // Clamp camera target to map bounds so the player can't pan off into the void
+    if (this.hmWidth > 0) {
+      const margin = 20; // cells — lets the edge sit comfortably on screen
+      this.target.x = THREE.MathUtils.clamp(this.target.x, -margin, this.hmWidth  + margin);
+      this.target.z = THREE.MathUtils.clamp(this.target.z, -margin, this.hmHeight + margin);
+    }
 
     // Set target Y to terrain surface (or sea level if over water)
     if (this.hmData) {

@@ -6,6 +6,7 @@ import { createProceduralBuildingDistricts } from './buildings';
 import { UnitManager } from './units/unit-manager';
 import { InputHandler, type InputCallbacks } from './input/click-handler';
 import { ClientPathfinder } from './pathfinding/client-pathfinding';
+import { buildVisionOverlay } from './vision-overlay';
 import type { Vec2, MoraleState, FirePosture, UnitDelta, ContactDelta, UnitSnapshot, ContactSnapshot, GameEvent } from '@legionaires/shared';
 
 // Terrain type → track cost (mirrors server TERRAIN_MOVE_COST for 'track')
@@ -54,8 +55,85 @@ tacticalLegend.innerHTML = [
   'RIGHT CLICK = MOVE ORDER',
   'SHIFT+RIGHT CLICK = QUEUE WAYPOINT',
   'G = REGEN TERRAIN | SHIFT+G = HI-RES',
+  'B = CYCLE BATLOC PRESET',
+  'C = TOGGLE VISION OVERLAY',
 ].join('<br>');
 document.body.appendChild(tacticalLegend);
+
+// --- Batloc selector panel ---
+const BATLOC_PRESETS = [
+  'plains', 'forest', 'mountains', 'jungle', 'desert',
+  'beach', 'river-crossing', 'stalingrad', 'finland',
+] as const;
+type BatlocKey = typeof BATLOC_PRESETS[number];
+
+let currentBatloc: BatlocKey = 'plains';
+
+const batlocPanel = document.createElement('div');
+batlocPanel.style.cssText = `
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  font-family: monospace;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: rgba(200, 210, 210, 0.85);
+  background: rgba(8, 10, 10, 0.62);
+  border: 1px solid rgba(128, 255, 216, 0.25);
+  padding: 8px 10px;
+  user-select: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 160px;
+`;
+
+const batlocLabel = document.createElement('div');
+batlocLabel.style.cssText = 'color: rgba(128, 255, 216, 0.7); margin-bottom: 2px;';
+batlocLabel.textContent = 'BATLOC PRESET';
+batlocPanel.appendChild(batlocLabel);
+
+const batlocSelect = document.createElement('select');
+batlocSelect.style.cssText = `
+  font-family: monospace;
+  font-size: 11px;
+  background: rgba(8, 10, 10, 0.8);
+  color: rgba(200, 210, 210, 0.9);
+  border: 1px solid rgba(128, 255, 216, 0.35);
+  padding: 2px 4px;
+  cursor: pointer;
+  outline: none;
+  width: 100%;
+`;
+for (const key of BATLOC_PRESETS) {
+  const opt = document.createElement('option');
+  opt.value = key;
+  opt.textContent = key.toUpperCase().replace(/-/g, ' ');
+  batlocSelect.appendChild(opt);
+}
+batlocSelect.value = currentBatloc;
+batlocSelect.addEventListener('change', () => {
+  currentBatloc = batlocSelect.value as BatlocKey;
+});
+batlocPanel.appendChild(batlocSelect);
+
+const batlocRegenBtn = document.createElement('button');
+batlocRegenBtn.style.cssText = `
+  font-family: monospace;
+  font-size: 11px;
+  background: rgba(20, 30, 20, 0.8);
+  color: rgba(128, 255, 216, 0.85);
+  border: 1px solid rgba(128, 255, 216, 0.35);
+  padding: 3px 6px;
+  cursor: pointer;
+  margin-top: 2px;
+  letter-spacing: 0.05em;
+`;
+batlocRegenBtn.textContent = 'REGEN (G)';
+batlocRegenBtn.addEventListener('click', () => requestTerrainRegen(false));
+batlocPanel.appendChild(batlocRegenBtn);
+
+document.body.appendChild(batlocPanel);
 
 // --- Network ---
 const connection = new GameConnection();
@@ -64,6 +142,23 @@ const connection = new GameConnection();
 let terrainGroup: THREE.Group | null = null;
 let buildingsGroup: THREE.Group | null = null;
 let currentTerrainData: TerrainData | null = null;
+let visionOverlay: THREE.Mesh | null = null;
+let visionUnitId: string | null = null;    // which unit's vision to track
+let visionLastX = 0;                        // position when overlay was last built
+let visionLastZ = 0;
+let lastVisionRebuildMs = 0;
+const VISION_REBUILD_DIST_SQ = 0.25;       // 0.5 cells² — rebuild after moving 0.5 cells
+const VISION_REBUILD_MIN_MS  = 120;        // cap at ~8 rebuilds/sec
+
+function clearVisionOverlay(): void {
+  if (visionOverlay) {
+    scene.remove(visionOverlay);
+    visionOverlay.geometry.dispose();
+    (visionOverlay.material as THREE.Material).dispose();
+    visionOverlay = null;
+  }
+  visionUnitId = null;
+}
 
 // Unit systems — created once, reused across terrain regenerations
 const unitManager = new UnitManager(scene, cameraController.camera);
@@ -204,6 +299,7 @@ connection.on('terrain', (msg: { data: TerrainData }) => {
   unitManager.clearAll();
   unitMoves.clear();
   pathfinder.clearPathPreview(scene);
+  clearVisionOverlay();
 
   // Find a dry, walkable spawn point — spiral outward from map centre
   let cx = Math.floor(msg.data.width / 2);
@@ -277,33 +373,66 @@ connection.on('MISSION_STATE_FULL', (msg: { payload: { units: UnitSnapshot[]; co
 
 connection.connect();
 
-// Terrain regeneration hotkey (G)
-window.addEventListener('keydown', (e) => {
-  if (e.code !== 'KeyG' || e.repeat) return;
+// Terrain regeneration — shared by hotkey and UI button
+function requestTerrainRegen(hiRes: boolean): void {
   const seed = Math.random() * 1_000_000;
-  if (e.shiftKey) {
-    console.log(`Requesting HI-RES terrain seed=${seed.toFixed(0)} (640x640)`);
-    connection.send('generate', { seed, width: 640, height: 640 });
+  const payload: Record<string, unknown> = { seed, batloc: currentBatloc };
+  if (hiRes) { payload.width = 640; payload.height = 640; }
+  console.log(`Requesting terrain seed=${seed.toFixed(0)} batloc=${currentBatloc}${hiRes ? ' (hi-res)' : ''}`);
+  connection.send('generate', payload);
+}
+
+// Terrain regeneration hotkeys
+window.addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  if (e.code === 'KeyG') {
+    requestTerrainRegen(e.shiftKey);
     return;
   }
-  console.log(`Requesting terrain seed=${seed.toFixed(0)}`);
-  connection.send('generate', { seed });
+  // B = cycle batloc preset forward
+  if (e.code === 'KeyB') {
+    const idx = BATLOC_PRESETS.indexOf(currentBatloc);
+    currentBatloc = BATLOC_PRESETS[(idx + 1) % BATLOC_PRESETS.length];
+    batlocSelect.value = currentBatloc;
+    return;
+  }
+  // C = toggle vision overlay for selected unit
+  if (e.code === 'KeyC') {
+    if (visionUnitId) {
+      clearVisionOverlay();
+      return;
+    }
+    const selectedIds = unitManager.getSelectedIds();
+    if (selectedIds.length === 0 || !currentTerrainData) return;
+    const unit = unitManager.getUnit(selectedIds[0]);
+    if (!unit) return;
+    visionUnitId        = unit.unitId;
+    visionLastX         = unit.posX;
+    visionLastZ         = unit.posZ;
+    lastVisionRebuildMs = performance.now();
+    visionOverlay = buildVisionOverlay(
+      unit.posX,
+      unit.posZ,
+      currentTerrainData,
+      (x, z) => cameraController.getTerrainHeight(x, z),
+    );
+    scene.add(visionOverlay);
+  }
 });
 
 // --- M1 client-side movement integration ---
 // In M2 this is replaced by server-authoritative movement via the tick loop.
 //
-// Positions (posX/posZ) are in CELL INDICES. Terrain resolution (m/cell) converts
-// real-world m/s speeds into cells/sec so the unit moves at the correct visual pace.
-//   8 m/s ÷ 20 m/cell = 0.4 cells/sec ≈ 29 km/h advance speed
+// Positions (posX/posZ) are cell indices (0..width-1). One cell = 20 real metres.
+// Speed in m/s must be divided by CELL_REAL_M to get cells/sec:
+//   8 m/s ÷ 20 m/cell = 0.4 cells/sec ≈ 29 km/h advance — 1 km square in ~2 min.
 const UNIT_SPEED_M_PER_SEC = 8; // ~29 km/h cross-country advance
+const CELL_REAL_M = 20;         // real-world metres represented by one terrain cell
 
 function tickClientMovement(dt: number): void {
   if (!currentTerrainData) return;
 
-  // Convert m/s → cells/sec using the terrain's real-world cell size
-  const resolution = currentTerrainData.resolution; // m per cell (20)
-  const speedCellsPerSec = UNIT_SPEED_M_PER_SEC / resolution;
+  const speedCellsPerSec = UNIT_SPEED_M_PER_SEC / CELL_REAL_M;
 
   for (const [unitId, move] of unitMoves) {
     const unit = unitManager.getUnit(unitId);
@@ -363,6 +492,40 @@ function animate() {
   cameraController.update(dt);
   tickClientMovement(dt);
   unitManager.updateFrame();
+
+  // --- Vision overlay: rebuild when tracked unit has moved enough ---
+  if (visionUnitId && currentTerrainData) {
+    const unit = unitManager.getUnit(visionUnitId);
+    if (!unit || unit.isDestroyed) {
+      clearVisionOverlay();
+    } else {
+      const dx = unit.posX - visionLastX;
+      const dz = unit.posZ - visionLastZ;
+      const now = performance.now();
+      if (
+        dx * dx + dz * dz >= VISION_REBUILD_DIST_SQ &&
+        now - lastVisionRebuildMs >= VISION_REBUILD_MIN_MS
+      ) {
+        // Dispose old mesh, keep visionUnitId alive
+        if (visionOverlay) {
+          scene.remove(visionOverlay);
+          visionOverlay.geometry.dispose();
+          (visionOverlay.material as THREE.Material).dispose();
+          visionOverlay = null;
+        }
+        visionLastX         = unit.posX;
+        visionLastZ         = unit.posZ;
+        lastVisionRebuildMs = now;
+        visionOverlay = buildVisionOverlay(
+          unit.posX,
+          unit.posZ,
+          currentTerrainData,
+          (x, z) => cameraController.getTerrainHeight(x, z),
+        );
+        scene.add(visionOverlay);
+      }
+    }
+  }
 
   renderer.render(scene, cameraController.camera);
 }

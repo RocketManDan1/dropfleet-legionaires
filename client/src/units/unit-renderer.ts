@@ -9,6 +9,8 @@
 // ============================================================================
 
 import * as THREE from 'three';
+import ms from 'milsymbol';
+import type { ColorMode } from 'milsymbol';
 import type {
   FactionId,
   ContactTier,
@@ -17,13 +19,6 @@ import type {
 import {
   FACTION_COLORS,
 } from '@legionaires/shared';
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/** Frame shape drawn around the NATO icon, determined by faction. */
-export type FrameShape = 'rectangle' | 'diamond' | 'hexagon' | 'quatrefoil';
 
 /** All data the renderer needs to create or update a single icon. */
 export interface IconDescriptor {
@@ -59,11 +54,6 @@ const MAX_CACHE_BYTES = 1_500_000;
 const ICON_W = 64;
 const ICON_H = 80;
 
-/** Health bar dimensions relative to icon. */
-const HEALTH_BAR_WIDTH = 48;
-const HEALTH_BAR_HEIGHT = 5;
-const HEALTH_BAR_OFFSET_Y = -28;
-
 /** Selection ring radius in world units. */
 const SELECTION_RING_RADIUS = 3.0;
 const SELECTION_RING_SEGMENTS = 32;
@@ -73,33 +63,97 @@ const SELECTION_RING_COLOR = new THREE.Color(0x00ff88);
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// milsymbol integration — SIDC codes and color mode
+// ---------------------------------------------------------------------------
+
 /**
- * Maps a faction identifier to its NATO frame shape.
- * - Terran Federation: rectangle (friendly standard)
- * - Khroshi Syndicalists: diamond (hostile standard)
- * - Ataxian Hive: hexagon (non-standard hostile — bio swarm)
- * - Unknown: quatrefoil (unidentified contact)
+ * DRONECOM frame colour mode: maps NATO affiliations to our faction palette.
+ * Both hostile factions share the red hostile slot; milsymbol picks the right
+ * entry automatically based on the identity character in the SIDC.
  */
-function factionToFrameShape(faction: FactionId | 'unknown'): FrameShape {
-  switch (faction) {
-    case 'federation': return 'rectangle';
-    case 'khroshi':    return 'diamond';
-    case 'ataxian':    return 'hexagon';
-    default:           return 'quatrefoil';
+const DRONECOM_FRAME_COLOR: ColorMode = {
+  Friend:   FACTION_COLORS.federation.frame, // #4080FF
+  Hostile:  FACTION_COLORS.ataxian.frame,    // #E04020
+  Neutral:  '#30C030',
+  Unknown:  FACTION_COLORS.unknown.frame,    // #D09020
+  Civilian: '#A060C0',
+  Suspect:  FACTION_COLORS.unknown.frame,
+};
+
+/**
+ * [battle-dimension, 11-char function+modifier string] per unit class.
+ * Positions 5-15 of the 15-char MIL-STD-2525C SIDC.
+ * Source: APP-6D / MIL-STD-2525C function codes.
+ */
+const UNIT_SIDC_PARTS: Record<UnitClass, [string, string]> = {
+  mbt:                  ['G', 'UCA--------'],  // Armor / Tank
+  ifv:                  ['G', 'UCIZ-------'],  // Mechanized Infantry (IFV)
+  apc:                  ['G', 'UCAA-------'],  // Armored Personnel Carrier
+  infantry:             ['G', 'UCI--------'],  // Infantry
+  at_infantry:          ['G', 'UCI--------'],  // Infantry (AT role)
+  aa_infantry:          ['G', 'UCI--------'],  // Infantry (AA role)
+  engineer:             ['G', 'UCE--------'],  // Combat Engineer
+  sniper:               ['G', 'UCI--------'],  // Infantry (sniper)
+  scout:                ['G', 'UCRR-------'],  // Reconnaissance
+  hq:                   ['G', 'UCI--------'],  // Command (infantry frame)
+  arty_sp:              ['G', 'UCFS-------'],  // Field Artillery, SP
+  arty_towed:           ['G', 'UCFT-------'],  // Field Artillery, Towed
+  mortar:               ['G', 'UCFM-------'],  // Mortar
+  at_vehicle:           ['G', 'UCAAT------'],  // Anti-Tank Vehicle
+  aa_vehicle:           ['G', 'UCAAA------'],  // Air Defense Vehicle
+  support:              ['G', 'USS--------'],  // Combat Service Support
+  supply:               ['G', 'USM--------'],  // Supply / Maintenance
+  helicopter_attack:    ['A', 'MFHA-------'],  // Attack Helicopter
+  helicopter_transport: ['A', 'MFHD-------'],  // Utility / Transport Helicopter
+  fixed_wing:           ['A', 'MFF--------'],  // Fixed-Wing Aircraft
+};
+
+/**
+ * Builds a 15-character MIL-STD-2525C SIDC for a given unit class and faction.
+ * DETECTED tier shows the affiliation frame but no specific unit type.
+ */
+function buildSIDC(
+  unitClass: UnitClass,
+  faction: FactionId | 'unknown',
+  detectionTier: ContactTier,
+): string {
+  const id =
+    faction === 'federation' ? 'F' :
+    faction === 'unknown'    ? 'U' : 'H';
+
+  const [dim, funcMod] = UNIT_SIDC_PARTS[unitClass] ?? ['G', 'UCI--------'];
+
+  // DETECTED: show affiliation frame only — no inner function glyph
+  if (detectionTier === 'DETECTED') {
+    return `S${id}${dim}P-----------`;
   }
+  return `S${id}${dim}P${funcMod}`;
+}
+
+/**
+ * Crew health bucket — coarse-grained so we don't re-render the canvas on
+ * every crew loss, only when crossing a visible colour threshold.
+ */
+function crewBucket(crewCurrent: number, crewMax: number): 'full' | 'half' | 'low' {
+  const f = crewMax > 0 ? crewCurrent / crewMax : 0;
+  if (f > 0.66) return 'full';
+  if (f > 0.33) return 'half';
+  return 'low';
 }
 
 /**
  * Builds a unique cache key from the visual parameters that affect rendering.
- * Detection tier changes what's drawn, so it must be part of the key.
- * Health is NOT part of the key — the health bar is drawn as a separate overlay.
+ * Crew bucket is included so the health bar re-renders on colour threshold crossings.
  */
 function buildCacheKey(
   unitTypeId: string,
   faction: FactionId | 'unknown',
   detectionTier: ContactTier,
+  crewCurrent: number,
+  crewMax: number,
 ): string {
-  return `${unitTypeId}:${faction}:${detectionTier}`;
+  return `${unitTypeId}:${faction}:${detectionTier}:${crewBucket(crewCurrent, crewMax)}`;
 }
 
 /**
@@ -197,18 +251,10 @@ export class UnitRenderer {
     const group = new THREE.Group();
     group.name = `unit-icon`;
 
-    // --- Icon sprite ---
+    // --- Icon sprite (health bar baked into canvas) ---
     const iconSprite = this._createIconSprite(descriptor);
     iconSprite.name = 'icon-sprite';
     group.add(iconSprite);
-
-    // --- Health bar sprite ---
-    const healthSprite = this._createHealthBarSprite(
-      descriptor.crewCurrent,
-      descriptor.crewMax,
-    );
-    healthSprite.name = 'health-sprite';
-    group.add(healthSprite);
 
     // --- Selection ring ---
     const ring = new THREE.LineLoop(
@@ -238,10 +284,12 @@ export class UnitRenderer {
         descriptor.unitTypeId,
         descriptor.faction,
         descriptor.detectionTier,
+        descriptor.crewCurrent,
+        descriptor.crewMax,
       );
       const currentKey = (iconSprite.userData as { cacheKey?: string }).cacheKey;
       if (currentKey !== cacheKey) {
-        // Need to re-render icon canvas
+        // Need to re-render icon canvas (tier change or crew bucket change)
         const texture = this._getOrRenderIcon(descriptor);
         if (texture) {
           (iconSprite.material as THREE.SpriteMaterial).map = texture;
@@ -250,16 +298,6 @@ export class UnitRenderer {
         }
         // If render budget exhausted, skip this frame — will catch up next frame
       }
-    }
-
-    // Always update health bar (cheap canvas redraw)
-    const healthSprite = group.getObjectByName('health-sprite') as THREE.Sprite | undefined;
-    if (healthSprite) {
-      this._updateHealthBarTexture(
-        healthSprite,
-        descriptor.crewCurrent,
-        descriptor.crewMax,
-      );
     }
 
     // Toggle selection ring visibility
@@ -306,12 +344,14 @@ export class UnitRenderer {
     const sprite = new THREE.Sprite(material);
     // Scale maintains canvas aspect ratio (64×80) so labels don't squish.
     sprite.scale.set(0.08, 0.08 * (ICON_H / ICON_W), 1);
-    sprite.position.set(0, 5, 0); // float above terrain surface
+    sprite.position.set(0, 1.5, 0); // float just above terrain surface
     sprite.userData = {
       cacheKey: buildCacheKey(
         descriptor.unitTypeId,
         descriptor.faction,
         descriptor.detectionTier,
+        descriptor.crewCurrent,
+        descriptor.crewMax,
       ),
     };
 
@@ -327,6 +367,8 @@ export class UnitRenderer {
       descriptor.unitTypeId,
       descriptor.faction,
       descriptor.detectionTier,
+      descriptor.crewCurrent,
+      descriptor.crewMax,
     );
 
     // Cache hit?
@@ -384,21 +426,19 @@ export class UnitRenderer {
     canvas.width = ICON_W;
     canvas.height = ICON_H;
     const ctx = canvas.getContext('2d')!;
-
-    const colors = FACTION_COLORS[descriptor.faction === 'unknown' ? 'unknown' : descriptor.faction];
-    const frameShape = factionToFrameShape(descriptor.faction);
-
     ctx.clearRect(0, 0, ICON_W, ICON_H);
 
-    // Frame occupies the top portion of the canvas.
-    const fX = 3, fY = 4, fW = ICON_W - 6, fH = 38;
-    const cx = fX + fW / 2;
-    const cy = fY + fH / 2;
+    const colors = FACTION_COLORS[descriptor.faction === 'unknown' ? 'unknown' : descriptor.faction];
+    const cx = ICON_W / 2;
 
-    // ---- SUSPECTED: small pulsing blip, no frame ----
+    // Symbol area: top 40px of the 64×80 canvas
+    const symAreaH = 40;
+
+    // ---- SUSPECTED: faction-coloured blip with '?' ----
     if (descriptor.detectionTier === 'SUSPECTED') {
+      const bx = cx, by = symAreaH / 2;
       ctx.beginPath();
-      ctx.arc(ICON_W / 2, fY + fH / 2, 9, 0, Math.PI * 2);
+      ctx.arc(bx, by, 9, 0, Math.PI * 2);
       ctx.fillStyle = colors.fill;
       ctx.fill();
       ctx.strokeStyle = colors.frame;
@@ -408,15 +448,16 @@ export class UnitRenderer {
       ctx.font = 'bold 11px monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText('?', ICON_W / 2, fY + fH / 2);
+      ctx.fillText('?', bx, by);
       return canvas;
     }
 
-    // ---- LOST: dashed frame, faded, no inner symbol ----
+    // ---- LOST: dashed rectangle, faded ----
     if (descriptor.detectionTier === 'LOST') {
       ctx.globalAlpha = 0.4;
       ctx.setLineDash([4, 4]);
-      this._drawFrameShape(ctx, frameShape, cx, cy, fX, fY, fW, fH);
+      ctx.beginPath();
+      ctx.rect(3, 2, ICON_W - 6, symAreaH - 4);
       ctx.strokeStyle = colors.frame;
       ctx.lineWidth = 2;
       ctx.stroke();
@@ -425,194 +466,56 @@ export class UnitRenderer {
       return canvas;
     }
 
-    // ---- DETECTED / CONFIRMED: solid frame + inner symbol + labels ----
+    // ---- DETECTED / CONFIRMED: milsymbol renders the authoritative NATO icon ----
+    const sidc = buildSIDC(descriptor.unitClass, descriptor.faction, descriptor.detectionTier);
+    try {
+      const sym = new ms.Symbol(sidc, {
+        size: 35,
+        fillColor: '#080C14',
+        frameColor: DRONECOM_FRAME_COLOR,
+        iconColor: '#FFFFFF',
+        infoFields: false,   // suppress milsymbol's own label fields
+      });
+      const symCanvas = sym.asCanvas();
+      const scale = Math.min((ICON_W - 4) / symCanvas.width, symAreaH / symCanvas.height);
+      const sw = symCanvas.width * scale;
+      const sh = symCanvas.height * scale;
+      ctx.drawImage(symCanvas, (ICON_W - sw) / 2, (symAreaH - sh) / 2, sw, sh);
+    } catch {
+      // Fallback: plain dark rect with faction frame if milsymbol errors
+      ctx.fillStyle = '#080C14';
+      ctx.fillRect(3, 2, ICON_W - 6, symAreaH - 4);
+      ctx.strokeStyle = colors.frame;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(3, 2, ICON_W - 6, symAreaH - 4);
+    }
 
-    // Frame fill: near-black with faction tint — DRONECOM "war room" look
-    this._drawFrameShape(ctx, frameShape, cx, cy, fX, fY, fW, fH);
-    ctx.fillStyle = '#080C14';
-    ctx.fill();
-    ctx.strokeStyle = colors.frame;
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
+    // ---- Health bar: 3px strip below symbol ----
+    const barX = 3, barY = symAreaH + 1, barW = ICON_W - 6, barH = 3;
+    const fraction = descriptor.crewMax > 0
+      ? Math.max(0, descriptor.crewCurrent / descriptor.crewMax) : 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.fillStyle = fraction > 0.66 ? '#22cc44' : fraction > 0.33 ? '#cccc22' : '#cc2222';
+    ctx.fillRect(barX, barY, Math.round(fraction * barW), barH);
+    ctx.strokeStyle = 'rgba(200,216,216,0.4)';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(barX, barY, barW, barH);
 
-    // Inner NATO symbol (geometric glyph, white)
-    this._drawNATOInnerSymbol(ctx, cx, cy, fH * 0.42, descriptor.unitClass);
-
-    // Labels below the frame (CONFIRMED only)
+    // ---- Labels below health bar (CONFIRMED only) ----
     if (descriptor.detectionTier === 'CONFIRMED') {
-      const labelY = fY + fH + 5;
+      const labelY = barY + barH + 2;
       ctx.textAlign = 'center';
-
-      // Unit class abbreviation — bright, easy to read
+      ctx.textBaseline = 'top';
       ctx.font = 'bold 10px monospace';
       ctx.fillStyle = '#C8D8E8';
-      ctx.textBaseline = 'top';
       ctx.fillText(this._unitClassAbbreviation(descriptor.unitClass), cx, labelY);
-
-      // Type ID — dimmer, faction colour
       ctx.font = '8px monospace';
       ctx.fillStyle = colors.frame;
       ctx.fillText(descriptor.unitTypeId.replace(/_/g, ' ').substring(0, 10), cx, labelY + 12);
     }
 
     return canvas;
-  }
-
-  /**
-   * Traces the faction frame shape path (no fill or stroke — caller applies those).
-   */
-  private _drawFrameShape(
-    ctx: CanvasRenderingContext2D,
-    shape: FrameShape,
-    cx: number, cy: number,
-    fX: number, fY: number, fW: number, fH: number,
-  ): void {
-    const r = Math.min(fW, fH) / 2;
-    ctx.beginPath();
-    switch (shape) {
-      case 'rectangle':
-        ctx.rect(fX, fY, fW, fH);
-        break;
-      case 'diamond':
-        ctx.moveTo(cx,        fY);
-        ctx.lineTo(fX + fW,  cy);
-        ctx.lineTo(cx,        fY + fH);
-        ctx.lineTo(fX,        cy);
-        ctx.closePath();
-        break;
-      case 'hexagon':
-        for (let i = 0; i < 6; i++) {
-          const a = (Math.PI / 3) * i - Math.PI / 6;
-          const px = cx + r * Math.cos(a);
-          const py = cy + r * Math.sin(a);
-          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-        }
-        ctx.closePath();
-        break;
-      case 'quatrefoil': {
-        const qr = r * 0.9;
-        for (let i = 0; i < 4; i++) {
-          const a = (Math.PI / 2) * i;
-          const px = cx + qr * Math.cos(a);
-          const py = cy + qr * Math.sin(a);
-          ctx.quadraticCurveTo(
-            cx + qr * 0.55 * Math.cos(a + Math.PI / 4),
-            cy + qr * 0.55 * Math.sin(a + Math.PI / 4),
-            px, py,
-          );
-        }
-        ctx.closePath();
-        break;
-      }
-    }
-  }
-
-  /**
-   * Draws the NATO inner glyph centred at (cx, cy).
-   * Uses purely geometric shapes — no text — matching the DRONECOM aesthetic.
-   *
-   * Glyph key:
-   *   Armor (MBT/IFV/APC/AT/AA vehicle) — diagonal line, bottom-left → top-right
-   *   Infantry variants                  — × (crossed diagonals)
-   *   Artillery / mortar                 — circle outline
-   *   Scout                              — small filled circle (dot)
-   *   HQ                                 — filled diamond pip
-   *   Helicopters                        — two arcs (rotor blades)
-   *   Fixed wing                         — wide chevron arc
-   *   Support / supply                   — horizontal dash
-   */
-  private _drawNATOInnerSymbol(
-    ctx: CanvasRenderingContext2D,
-    cx: number, cy: number,
-    size: number,
-    unitClass: UnitClass,
-  ): void {
-    ctx.strokeStyle = '#FFFFFF';
-    ctx.fillStyle = '#FFFFFF';
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'round';
-
-    switch (unitClass) {
-      case 'mbt':
-      case 'ifv':
-      case 'apc':
-      case 'at_vehicle':
-      case 'aa_vehicle':
-        // Armor: diagonal line, bottom-left to top-right
-        ctx.beginPath();
-        ctx.moveTo(cx - size * 0.55, cy + size * 0.45);
-        ctx.lineTo(cx + size * 0.55, cy - size * 0.45);
-        ctx.stroke();
-        break;
-
-      case 'infantry':
-      case 'at_infantry':
-      case 'aa_infantry':
-      case 'engineer':
-      case 'sniper':
-        // Infantry: × (two crossing diagonals)
-        ctx.beginPath();
-        ctx.moveTo(cx - size * 0.38, cy - size * 0.38);
-        ctx.lineTo(cx + size * 0.38, cy + size * 0.38);
-        ctx.moveTo(cx + size * 0.38, cy - size * 0.38);
-        ctx.lineTo(cx - size * 0.38, cy + size * 0.38);
-        ctx.stroke();
-        break;
-
-      case 'arty_sp':
-      case 'arty_towed':
-      case 'mortar':
-        // Artillery: circle outline
-        ctx.beginPath();
-        ctx.arc(cx, cy, size * 0.38, 0, Math.PI * 2);
-        ctx.stroke();
-        break;
-
-      case 'scout':
-        // Scout: small filled dot
-        ctx.beginPath();
-        ctx.arc(cx, cy, size * 0.22, 0, Math.PI * 2);
-        ctx.fill();
-        break;
-
-      case 'hq':
-        // HQ: small filled diamond pip
-        ctx.beginPath();
-        ctx.moveTo(cx,           cy - size * 0.38);
-        ctx.lineTo(cx + size * 0.28, cy);
-        ctx.lineTo(cx,           cy + size * 0.38);
-        ctx.lineTo(cx - size * 0.28, cy);
-        ctx.closePath();
-        ctx.fill();
-        break;
-
-      case 'helicopter_attack':
-      case 'helicopter_transport':
-        // Helicopters: two small arcs (stylised rotor)
-        ctx.beginPath();
-        ctx.arc(cx - size * 0.22, cy + size * 0.05, size * 0.28, Math.PI, 0);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.arc(cx + size * 0.22, cy + size * 0.05, size * 0.28, Math.PI, 0);
-        ctx.stroke();
-        break;
-
-      case 'fixed_wing':
-        // Fixed wing: wide chevron arc
-        ctx.beginPath();
-        ctx.moveTo(cx - size * 0.5, cy + size * 0.15);
-        ctx.quadraticCurveTo(cx, cy - size * 0.38, cx + size * 0.5, cy + size * 0.15);
-        ctx.stroke();
-        break;
-
-      default:
-        // Support / supply / unknown: horizontal dash
-        ctx.beginPath();
-        ctx.moveTo(cx - size * 0.38, cy);
-        ctx.lineTo(cx + size * 0.38, cy);
-        ctx.stroke();
-        break;
-    }
   }
 
   /**
@@ -643,93 +546,6 @@ export class UnitRenderer {
       fixed_wing: 'FW',
     };
     return abbreviations[unitClass] ?? '???';
-  }
-
-  // -------------------------------------------------------------------------
-  // Private — Health bar
-  // -------------------------------------------------------------------------
-
-  /**
-   * Creates a health bar sprite positioned below the icon.
-   */
-  private _createHealthBarSprite(
-    crewCurrent: number,
-    crewMax: number,
-  ): THREE.Sprite {
-    const canvas = this._renderHealthBarCanvas(crewCurrent, crewMax);
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.minFilter = THREE.LinearFilter;
-
-    const material = new THREE.SpriteMaterial({
-      map: texture,
-      transparent: true,
-      depthTest: false,
-      sizeAttenuation: false,
-    });
-
-    const sprite = new THREE.Sprite(material);
-    sprite.scale.set(0.05, 0.01, 1);
-    sprite.position.set(0, 3.5, 0); // below the icon sprite
-    sprite.userData = { canvas };
-
-    return sprite;
-  }
-
-  /**
-   * Updates an existing health bar sprite with new crew values.
-   */
-  private _updateHealthBarTexture(
-    sprite: THREE.Sprite,
-    crewCurrent: number,
-    crewMax: number,
-  ): void {
-    const canvas = (sprite.userData as { canvas: HTMLCanvasElement }).canvas;
-    this._renderHealthBarCanvas(crewCurrent, crewMax, canvas);
-    const material = sprite.material as THREE.SpriteMaterial;
-    if (material.map) {
-      material.map.needsUpdate = true;
-    }
-  }
-
-  /**
-   * Renders or re-renders the health bar onto a canvas.
-   */
-  private _renderHealthBarCanvas(
-    crewCurrent: number,
-    crewMax: number,
-    existingCanvas?: HTMLCanvasElement,
-  ): HTMLCanvasElement {
-    const canvas = existingCanvas ?? document.createElement('canvas');
-    canvas.width = HEALTH_BAR_WIDTH;
-    canvas.height = HEALTH_BAR_HEIGHT;
-    const ctx = canvas.getContext('2d')!;
-
-    ctx.clearRect(0, 0, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT);
-
-    // Background (dark)
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-    ctx.fillRect(0, 0, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT);
-
-    // Health fill
-    const fraction = crewMax > 0 ? Math.max(0, crewCurrent / crewMax) : 0;
-    const fillWidth = Math.round(fraction * HEALTH_BAR_WIDTH);
-
-    // Color: green > 66%, yellow > 33%, red <= 33%
-    if (fraction > 0.66) {
-      ctx.fillStyle = '#22cc44';
-    } else if (fraction > 0.33) {
-      ctx.fillStyle = '#cccc22';
-    } else {
-      ctx.fillStyle = '#cc2222';
-    }
-    ctx.fillRect(0, 0, fillWidth, HEALTH_BAR_HEIGHT);
-
-    // Border
-    ctx.strokeStyle = 'rgba(200, 210, 210, 0.5)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(0, 0, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT);
-
-    return canvas;
   }
 
   // -------------------------------------------------------------------------

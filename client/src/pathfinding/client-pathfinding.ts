@@ -395,10 +395,33 @@ export class ClientPathfinder {
 
     if (path.length < 2) return;
 
-    const points = path.map(p => {
-      const y = getTerrainHeight ? getTerrainHeight(p.x, p.z) + yOffset : yOffset;
-      return new THREE.Vector3(p.x, y, p.z);
-    });
+    // Densify: sample terrain height every 1 cell along each segment so the
+    // line hugs the terrain instead of cutting through hills between waypoints.
+    const SAMPLE_STEP = 1.0; // cells between height samples
+    const points: THREE.Vector3[] = [];
+
+    for (let i = 0; i < path.length - 1; i++) {
+      const a = path[i];
+      const b = path[i + 1];
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const segLen = Math.sqrt(dx * dx + dz * dz);
+      const steps = Math.max(1, Math.ceil(segLen / SAMPLE_STEP));
+
+      for (let s = 0; s < steps; s++) {
+        const t = s / steps;
+        const px = a.x + dx * t;
+        const pz = a.z + dz * t;
+        const y = getTerrainHeight ? getTerrainHeight(px, pz) + yOffset : yOffset;
+        points.push(new THREE.Vector3(px, y, pz));
+      }
+    }
+
+    // Always include the final waypoint
+    const last = path[path.length - 1];
+    const lastY = getTerrainHeight ? getTerrainHeight(last.x, last.z) + yOffset : yOffset;
+    points.push(new THREE.Vector3(last.x, lastY, last.z));
+
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
 
     this.previewLine = new THREE.Line(geometry, this.previewMaterial);
