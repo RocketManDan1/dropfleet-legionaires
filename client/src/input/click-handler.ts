@@ -137,6 +137,9 @@ export class InputHandler {
   private dragCurrentY = 0;
   private leftButtonDown = false;
 
+  /** Current movement mode for the Digit4 cycle. */
+  private currentMoveMode: MoveMode = 'advance';
+
   // --- Box select visual overlay ---
   private boxOverlay: HTMLDivElement;
 
@@ -204,6 +207,9 @@ export class InputHandler {
   // -------------------------------------------------------------------------
 
   private handleMouseDown(e: MouseEvent): void {
+    // Skip game-input when clicking on HUD / UI elements (buttons, selects, etc.)
+    if (this.isUIElement(e.target as HTMLElement)) return;
+
     if (e.button === 0) {
       // Left mouse button
       this.leftButtonDown = true;
@@ -241,6 +247,14 @@ export class InputHandler {
 
   private handleMouseUp(e: MouseEvent): void {
     if (e.button !== 0) return;
+
+    // Skip game-input when releasing on HUD / UI elements
+    if (this.isUIElement(e.target as HTMLElement)) {
+      this.leftButtonDown = false;
+      this.isDragging = false;
+      this.boxOverlay.style.display = 'none';
+      return;
+    }
 
     this.leftButtonDown = false;
 
@@ -333,22 +347,17 @@ export class InputHandler {
         this.callbacks.onFirePostureChange('hold_fire');
         break;
 
-      // --- Movement mode cycle (Milestone 2+) ---
-      case 'Digit4':
-        // TODO: Cycle through advance -> march -> reverse based on current mode
-        this.callbacks.onMoveModeChange('advance');
+      // --- Movement mode cycle: advance -> march -> reverse -> advance ---
+      case 'Digit4': {
+        const cycle: MoveMode[] = ['advance', 'march', 'reverse'];
+        const idx = cycle.indexOf(this.currentMoveMode);
+        this.currentMoveMode = cycle[(idx + 1) % cycle.length];
+        this.callbacks.onMoveModeChange(this.currentMoveMode);
         break;
+      }
 
-      // --- Special orders (Milestone 2+) ---
-      case 'KeyE':
-        this.callbacks.onSpecialOrder('entrench');
-        break;
-      case 'KeyK':
-        this.callbacks.onSpecialOrder('deploy_smoke');
-        break;
-      case 'KeyR':
-        this.callbacks.onSpecialOrder('rally');
-        break;
+      // Note: E, R, K, S, N, X etc. are handled by OrderButtonBar hotkeys.
+      // Do NOT duplicate them here — it causes conflicting orders.
 
       default:
         // Not a handled key — do nothing
@@ -392,6 +401,29 @@ export class InputHandler {
     }
 
     return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // UI element detection
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns true if the element (or any ancestor) is a HUD/UI control that
+   * should NOT be interpreted as a game-world click.
+   */
+  private isUIElement(el: HTMLElement | null): boolean {
+    if (!el) return false;
+    let node: HTMLElement | null = el;
+    while (node && node !== document.body) {
+      const tag = node.tagName;
+      if (tag === 'BUTTON' || tag === 'SELECT' || tag === 'INPUT' || tag === 'TEXTAREA') return true;
+      if (node.classList.contains('order-bar')) return true;
+      if (node.classList.contains('unit-panel')) return true;
+      if (node.classList.contains('deployment-screen')) return true;
+      if (node.classList.contains('aar-screen')) return true;
+      node = node.parentElement;
+    }
+    return false;
   }
 
   // -------------------------------------------------------------------------

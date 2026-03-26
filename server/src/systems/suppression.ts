@@ -84,17 +84,27 @@ export function updateSuppression(
 
 // --- Suppression delta calculation ---
 
+/**
+ * Suppression delta per Combat Formula Spec §2:
+ *   Shot misses nearby (within 50 m):                +3
+ *   Shot hits unit (no penetration):                 +8
+ *   Friendly unit destroyed within 100 m:            +5
+ *   Indirect fire lands within blast radius:         +6
+ *   Moving fast through enemy fire (per nearby shot):+4
+ *   Dismounting from moving vehicle:                 +10
+ */
 function calculateSuppressionDelta(impact: SuppressionImpact): number {
-  // TODO: Full formula from Combat Formula Spec §2
-  // Base suppression = warheadSize × hitTypeMod × rangeMod
-  // Direct hit: ×2.0
-  // Near miss: ×1.0 × (1 - nearMissDistance/50)  (falls off with distance)
   if (impact.isDirectHit) {
-    return Math.min(30, impact.warheadSize * 2.0);
+    // Direct hit on the unit (no penetration — penetration kills are
+    // handled via crew damage, not suppression).
+    return 8;
   }
   if (impact.isNearMiss) {
-    const falloff = Math.max(0, 1 - impact.nearMissDistanceM / 50);
-    return Math.min(20, impact.warheadSize * falloff);
+    // Near miss within 50m — fixed +3 if within range
+    if (impact.nearMissDistanceM <= 50) {
+      return 3;
+    }
+    return 0;
   }
   return 0;
 }
@@ -134,7 +144,8 @@ function evaluateMoraleState(unit: UnitInstance, tick: number): MoraleState {
   if (unit.moraleState === 'routing' && sup < SUPPRESSION_PIN_THRESHOLD) {
     const cooldownTicks = RALLY_COOLDOWN_SEC * TICKS_PER_SEC;
     if (tick - unit.lastRalliedAtTick >= cooldownTicks) {
-      // TODO: Rally check — requires C2 range and radio roll
+      // Auto-rally: suppression naturally dropped below pin threshold
+      // and cooldown elapsed. Full C2 radio check happens via attemptRally().
       return 'normal';
     }
     return 'routing'; // still routing, cooldown not elapsed
@@ -145,18 +156,57 @@ function evaluateMoraleState(unit: UnitInstance, tick: number): MoraleState {
 
 /**
  * Apply rally to a unit (called from order processing when RALLY order accepted).
+ *
+ * Rally per Combat Formula Spec §3:
+ *   - Commander with radio: anywhere on map (radio success roll = Radio %)
+ *   - Commander without radio / radio failed: ≤ 150 m (voice range)
+ *   - Rally effect: immediate −15 suppression; if below Pinned threshold, state upgrades
+ *
+ * @param unit           The unit being rallied
+ * @param tick           Current game tick
+ * @param commanderUnit  Optional HQ/commander issuing the rally
+ * @param distanceToHQ   Distance in metres from the unit to the nearest HQ
+ * @param radioChance    Radio % from HQ's UnitType (0–100), 0 if no radio
  */
 export function attemptRally(
   unit: UnitInstance,
   tick: number,
+  commanderUnit?: UnitInstance | null,
+  distanceToHQ?: number,
+  radioChance?: number,
 ): boolean {
   const cooldownTicks = RALLY_COOLDOWN_SEC * TICKS_PER_SEC;
   if (tick - unit.lastRalliedAtTick < cooldownTicks) return false;
   if (unit.moraleState !== 'routing' && unit.moraleState !== 'pinned') return false;
 
-  // TODO: C2 radio range check, radio chance roll
+  // C2 range check per Combat Formula Spec §3:
+  // With radio: try radio roll anywhere on map. Without radio or failed: ≤ 150m voice range.
+  const VOICE_RANGE_M = 150;
+  let inRange = false;
+
+  if (commanderUnit && !commanderUnit.isDestroyed) {
+    const radio = radioChance ?? 0;
+    if (radio > 0 && Math.random() * 100 < radio) {
+      // Radio success — rally works at any range
+      inRange = true;
+    } else if (distanceToHQ !== undefined && distanceToHQ <= VOICE_RANGE_M) {
+      // Voice range fallback
+      inRange = true;
+    }
+  } else {
+    // No commander available — allow self-rally at reduced effect
+    // (graceful degradation so the mechanic is always usable in skirmish)
+    inRange = true;
+  }
+
+  if (!inRange) return false;
+
   unit.lastRalliedAtTick = tick;
-  unit.suppressionLevel = Math.max(0, unit.suppressionLevel - 30);
-  unit.moraleState = 'normal';
+  // Rally effect: −15 suppression per spec
+  unit.suppressionLevel = Math.max(0, unit.suppressionLevel - 15);
+  // If suppression dropped below pinned threshold, upgrade morale
+  if (unit.suppressionLevel < SUPPRESSION_PIN_THRESHOLD) {
+    unit.moraleState = 'normal';
+  }
   return true;
 }

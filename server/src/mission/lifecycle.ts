@@ -33,6 +33,7 @@ export class MissionLifecycle {
   private deploymentTimerTicks: number;
   private missionTimeLimitTicks: number;
   private extractionTimerTicks: number;
+  private aarAutoCloseTicks: number;
 
   constructor(
     public readonly missionId: string,
@@ -43,6 +44,7 @@ export class MissionLifecycle {
     this.deploymentTimerTicks = DEPLOYMENT_TIMER_SEC * TICKS_PER_SEC;
     this.missionTimeLimitTicks = timeLimitSec * TICKS_PER_SEC;
     this.extractionTimerTicks = 60 * TICKS_PER_SEC; // 60s extraction window
+    this.aarAutoCloseTicks = 180 * TICKS_PER_SEC;
   }
 
   getPhase(): MissionPhaseInternal { return this.phase; }
@@ -90,9 +92,16 @@ export class MissionLifecycle {
         break;
 
       case 'aar':
-        // AAR stays until client acknowledges, then transition to closed
+        // AAR closes when all players acknowledge, all players leave,
+        // or the 180s auto-close timer expires.
         if (context.allPlayersAcknowledgedAAR) {
           return this.transition('closed', currentTick, 'aar_acknowledged');
+        }
+        if (context.playerCount === 0) {
+          return this.transition('closed', currentTick, 'aar_all_players_left');
+        }
+        if (ticksInPhase >= this.aarAutoCloseTicks) {
+          return this.transition('closed', currentTick, 'aar_timeout');
         }
         break;
     }

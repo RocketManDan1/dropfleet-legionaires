@@ -1,7 +1,7 @@
 // ============================================================================
 // TICK LOOP — 20 Hz fixed-rate game loop (50 ms per tick)
 // Source: SERVER_GAME_LOOP.md — 9 phases in strict single-threaded order
-// Milestone 2 scaffold
+// Milestones 2 + 3
 // ============================================================================
 
 import type {
@@ -9,6 +9,8 @@ import type {
   MissionState,
   ContactEntry,
   ResolvedOrder,
+  PlatoonIntent,
+  FirePosture,
 } from '@legionaires/shared';
 import {
   TICK_RATE_HZ,
@@ -197,11 +199,31 @@ export class TickLoop {
     }
 
     // -----------------------------------------------------------------------
+    // Phase 0: Mission Lifecycle — every tick
+    // Check mission phase transitions (M3)
+    // -----------------------------------------------------------------------
+    this.phaseMissionLifecycle();
+
+    // Skip combat phases if not in LIVE phase
+    const phase = this.session.getPhase();
+    const isLive = phase === 'live';
+    const isDeploymentOrLive = phase === 'deployment' || isLive;
+
+    // -----------------------------------------------------------------------
+    // Phase 0b: Objective Updates — every tick during LIVE phase (M3)
+    // -----------------------------------------------------------------------
+    if (isLive) {
+      this.phaseObjectiveUpdates();
+    }
+
+    // -----------------------------------------------------------------------
     // Phase 1: Input Processing — every tick
     // Read inbound order queue, validate, write to per-unit order state
     // -----------------------------------------------------------------------
     const p1Start = performance.now();
-    this.phaseInputProcessing();
+    if (isDeploymentOrLive) {
+      this.phaseInputProcessing();
+    }
     this.lastTimings.inputMs = performance.now() - p1Start;
 
     // -----------------------------------------------------------------------
@@ -214,37 +236,43 @@ export class TickLoop {
     this.lastTimings.commandMs = performance.now() - p2Start;
 
     // -----------------------------------------------------------------------
-    // Phase 3: Movement Resolution — every tick
+    // Phase 3: Movement Resolution — every tick (LIVE only)
     // Integrate unit positions along paths
     // -----------------------------------------------------------------------
     const p3Start = performance.now();
-    this.phaseMovementResolution(dt);
+    if (isLive) {
+      this.phaseMovementResolution(dt);
+    }
     this.lastTimings.movementMs = performance.now() - p3Start;
 
     // -----------------------------------------------------------------------
-    // Phase 4: Spotting Updates — every second (tick % 20 === 0)
+    // Phase 4: Spotting Updates — every second (tick % 20 === 0), LIVE only
     // Pairwise LOS checks, accumulator updates, contact tier changes
     // -----------------------------------------------------------------------
     const p4Start = performance.now();
-    if (isSecondTick) {
+    if (isSecondTick && isLive) {
       this.phaseSpottingUpdates();
     }
     this.lastTimings.spottingMs = performance.now() - p4Start;
 
     // -----------------------------------------------------------------------
-    // Phase 5: Fire Resolution — every tick
+    // Phase 5: Fire Resolution — every tick (LIVE only)
     // 5a: auto-fire for FREE_FIRE units, 5b: player ENGAGE orders
     // -----------------------------------------------------------------------
     const p5Start = performance.now();
-    this.phaseFireResolution(dt);
+    if (isLive) {
+      this.phaseFireResolution(dt);
+    }
     this.lastTimings.fireMs = performance.now() - p5Start;
 
     // -----------------------------------------------------------------------
-    // Phase 6: Damage Application — every tick
+    // Phase 6: Damage Application — every tick (LIVE only)
     // Process shot records, to-hit, pen, crew damage, ERA depletion
     // -----------------------------------------------------------------------
     const p6Start = performance.now();
-    this.phaseDamageApplication();
+    if (isLive) {
+      this.phaseDamageApplication();
+    }
     this.lastTimings.damageMs = performance.now() - p6Start;
 
     // -----------------------------------------------------------------------
@@ -256,11 +284,11 @@ export class TickLoop {
     this.lastTimings.suppressionMs = performance.now() - p7Start;
 
     // -----------------------------------------------------------------------
-    // Phase 8: Supply Tick — every second
+    // Phase 8: Supply Tick — every second (LIVE only)
     // Trickle resupply from supply vehicles within 150 m
     // -----------------------------------------------------------------------
     const p8Start = performance.now();
-    if (isSecondTick) {
+    if (isSecondTick && isLive) {
       this.phaseSupplyTick(dt);
     }
     this.lastTimings.supplyMs = performance.now() - p8Start;
@@ -353,22 +381,102 @@ export class TickLoop {
    * AI decisions are injected here before player orders propagate.
    */
   private phaseCommandPropagation(): void {
+    const units = this.session.getUnitRegistry();
+
     // --- AI layer injection (runs at start of Phase 2 per ENEMY_AI.md §2) ---
+    const strategicAI = this.session.getStrategicAI();
+    const platoonBT = this.session.getPlatoonBT();
+    const influenceMapMgr = this.session.getInfluenceMapManager();
+    const platoons = this.session.getPlatoons();
+    const objectives = this.session.getObjectives();
 
     // Strategic AI: every 5 seconds (100 ticks)
-    if (this.tick % AI_STRATEGIC_UPDATE_TICKS === 0) {
-      // TODO: Call strategicAI.evaluate(missionState, influenceMaps)
-      //       Updates platoon intents (attack/defend/reinforce/retreat/patrol)
+    if (strategicAI && influenceMapMgr && this.tick % AI_STRATEGIC_UPDATE_TICKS === 0) {
+      // Rebuild influence maps from current unit positions
+      influenceMapMgr.rebuild(units, strategicAI.faction);
+
+      // Build InfluenceMaps view for the strategic + BT layers
+      const influenceMaps = {
+        threat: {
+          data: (influenceMapMgr as any).threatGrid as Float32Array,
+          width: influenceMapMgr.gridWidth,
+          height: influenceMapMgr.gridHeight,
+          cellSizeM: influenceMapMgr.cellSizeM,
+        },
+        control: {
+          data: (influenceMapMgr as any).controlGrid as Float32Array,
+          width: influenceMapMgr.gridWidth,
+          height: influenceMapMgr.gridHeight,
+          cellSizeM: influenceMapMgr.cellSizeM,
+        },
+      };
+      this.session.setInfluenceMaps(influenceMaps);
+
+      // Run strategic evaluation
+      const decision = strategicAI.update(
+        this.tick, units, platoons, objectives, influenceMaps,
+      );
+
+      // Apply strategic intents to platoons
+      for (const [platoonId, intent] of decision.assignedIntents) {
+        const platoon = platoons.get(platoonId);
+        if (platoon) platoon.intent = intent;
+      }
     }
 
     // Platoon behavior trees: every 1 second (20 ticks)
-    if (this.tick % AI_PLATOON_BT_TICKS === 0) {
-      // TODO: Call platoonBT.tick(platoons, aiContext)
-      //       Produces per-unit movement/fire orders for AI platoons
+    if (platoonBT && this.tick % AI_PLATOON_BT_TICKS === 0) {
+      const cachedMaps = this.session.getInfluenceMaps();
+      if (cachedMaps) {
+        for (const [, platoon] of platoons) {
+          // Only run BTs for AI-owned platoons
+          if (platoon.factionId === 'federation') continue;
+
+          // Find nearest detected enemy for this platoon
+          let nearestEnemy: { x: number; z: number } | null = null;
+          let nearestDist = Infinity;
+          for (const uid of platoon.unitIds) {
+            const u = units.get(uid);
+            if (!u || u.isDestroyed) continue;
+            for (const [, otherUnit] of units) {
+              if (otherUnit.isDestroyed || otherUnit.ownerId === u.ownerId) continue;
+              const dx = otherUnit.posX - u.posX;
+              const dz = otherUnit.posZ - u.posZ;
+              const d = dx * dx + dz * dz;
+              if (d < nearestDist) {
+                nearestDist = d;
+                nearestEnemy = { x: otherUnit.posX, z: otherUnit.posZ };
+              }
+            }
+          }
+
+          const ctx = platoonBT.buildContext(
+            platoon.platoonId,
+            platoon.factionId as any,
+            platoon.intent as PlatoonIntent,
+            platoon.unitIds,
+            platoon.commandUnitId,
+            units,
+            cachedMaps,
+            objectives,
+            nearestEnemy,
+          );
+
+          const btResult = platoonBT.tick(ctx, units);
+
+          // Convert BT orders into unit orders
+          for (const order of btResult.orders) {
+            const unit = units.get(order.unitId);
+            if (!unit || unit.isDestroyed) continue;
+            const normalized = this.normalizeAIOrder(order.orderType, order.targetPos, order.targetUnitId);
+            if (!normalized) continue;
+            unit.currentOrder = normalized;
+          }
+        }
+      }
     }
 
     // --- Player order propagation ---
-    const units = this.session.getUnitRegistry();
     for (const [unitId, unit] of units) {
       void unitId;
       if (unit.isDestroyed) continue;
@@ -408,6 +516,43 @@ export class TickLoop {
   }
 
   /**
+   * Maps platoon-BT order strings to canonical runtime order types.
+   * This keeps AI orders compatible with the existing command propagation path.
+   */
+  private normalizeAIOrder(
+    orderType: string,
+    targetPos?: { x: number; z: number },
+    targetUnitId?: string,
+  ): ResolvedOrder | null {
+    if (orderType === 'move_advance') {
+      return { type: 'move', targetPos, moveMode: 'advance' };
+    }
+    if (orderType === 'move_march') {
+      return { type: 'move', targetPos, moveMode: 'march' };
+    }
+    if (orderType === 'move_reverse') {
+      return { type: 'move', targetPos, moveMode: 'reverse' };
+    }
+    if (orderType === 'engage_pos') {
+      return { type: 'area_fire', targetPos };
+    }
+    if (orderType === 'set_posture') {
+      const posture = targetUnitId as FirePosture | undefined;
+      if (posture === 'free_fire' || posture === 'return_fire' || posture === 'hold_fire') {
+        return { type: 'set_posture', posture };
+      }
+      return null;
+    }
+    if (orderType === 'hold_position') {
+      return { type: 'cancel' };
+    }
+    if (orderType === 'cancel') {
+      return { type: 'cancel' };
+    }
+    return null;
+  }
+
+  /**
    * Phase 3: Movement Resolution — runs every tick.
    * Integrates unit positions along their active path.
    */
@@ -417,7 +562,7 @@ export class TickLoop {
     const spatialHash = this.session.getSpatialHash();
     const costGrids = this.session.getCostGrids();
 
-    resolveMovement(units, dt, terrain, costGrids, this.session.getUnitTypeRegistry());
+    resolveMovement(units, dt, terrain, costGrids, this.session.getUnitTypeRegistry(), this.tick);
 
     // After positions change, update the spatial hash
     spatialHash.rebuildFromUnits(units);
@@ -550,5 +695,89 @@ export class TickLoop {
    */
   private phaseBroadcast(): void {
     broadcastGameState(this.session, this.tickEvents, this.tick);
+  }
+
+  // -------------------------------------------------------------------------
+  // M3: Mission Lifecycle phase
+  // -------------------------------------------------------------------------
+
+  /**
+   * Phase 0: Mission Lifecycle — runs every tick.
+   * Checks the mission state machine for phase transitions.
+   */
+  private phaseMissionLifecycle(): void {
+    const lifecycle = this.session.getLifecycle();
+    if (!lifecycle) return;
+
+    const units = this.session.getUnitRegistry();
+    const players = this.session.getPlayers();
+    const objTracker = this.session.getObjectiveTracker();
+
+    // Build lifecycle context
+    let playerCount = 0;
+    let allReady = true;
+    let allAckedAAR = true;
+
+    for (const [, conn] of players) {
+      if (conn.isConnected) {
+        playerCount++;
+        if (!conn.readyForDeployment) allReady = false;
+        if (!conn.acknowledgedAAR) allAckedAAR = false;
+      }
+    }
+    // For "all players ready" to be meaningful, need at least 1 player
+    if (playerCount === 0) allReady = false;
+
+    // Check if all player units are destroyed
+    let anyPlayerUnitAlive = false;
+    for (const [, unit] of units) {
+      if (unit.isDestroyed) continue;
+      if (unit.ownerId !== this.session.getAiFactionId()) {
+        anyPlayerUnitAlive = true;
+        break;
+      }
+    }
+
+    const context = {
+      playerCount,
+      allPlayersReady: allReady,
+      allObjectivesComplete: objTracker?.allPrimaryComplete() ?? false,
+      allPlayerUnitsDestroyed: playerCount > 0 && !anyPlayerUnitAlive,
+      allPlayersAcknowledgedAAR: playerCount > 0 && allAckedAAR,
+    };
+
+    const transition = lifecycle.tick(this.tick, context);
+    if (transition) {
+      console.log(`[TickLoop] Mission phase: ${transition.fromPhase} -> ${transition.toPhase} (${transition.reason})`);
+      this.session.setPhase(transition.toPhase);
+      this.session.onPhaseTransition(transition.toPhase, transition.reason, this.tick);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // M3: Objective Updates phase
+  // -------------------------------------------------------------------------
+
+  /**
+   * Phase 0b: Objective Updates — runs every tick during LIVE phase.
+   */
+  private phaseObjectiveUpdates(): void {
+    const objTracker = this.session.getObjectiveTracker();
+    if (!objTracker) return;
+
+    const units = this.session.getUnitRegistry();
+    const updates = objTracker.update(units, this.tick);
+
+    // Push objective update events for broadcast
+    for (const update of updates) {
+      this.tickEvents.push({
+        type: 'OBJECTIVE_UPDATE',
+        data: {
+          objectiveId: update.objectiveId,
+          progress: update.progress,
+          isCompleted: update.isCompleted,
+        },
+      });
+    }
   }
 }

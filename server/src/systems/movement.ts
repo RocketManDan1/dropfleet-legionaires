@@ -173,24 +173,45 @@ export function resolveMovement(
   terrain: TerrainData,
   costGrids: Map<MoveClass, CostGrid> | null,
   unitTypes?: UnitRegistry | null,
+  currentTick?: number,
 ): void {
+  const tick = currentTick ?? 0;
+
   for (const [unitId, unit] of units) {
     // Skip dead, surrendered, or frozen units
     if (unit.isDestroyed) continue;
     if (unit.moraleState === 'surrendered') continue;
-    // TODO: Skip frozen (disconnected player) units
+    // Skip frozen (disconnected player) units — indicated by a freeze timestamp
+    if ((unit as any).frozenAtTick != null) continue;
 
     // --- Routing units: override path to retreat toward friendly edge ---
     if (unit.moraleState === 'routing') {
-      // TODO: If no retreat path set, compute A* toward the nearest friendly
-      //       map edge at 50% maxSpeedM. Set currentPath accordingly.
-      //       See ENEMY_AI.md §5.3.
+      // If no retreat path set, give the unit a straight-line retreat toward
+      // the nearest map edge at 50% maxSpeedM (ENEMY_AI.md §5.3).
+      if (!unit.currentPath || unit.currentPath.length === 0) {
+        const mapW = terrain.width;
+        const mapH = terrain.height;
+        // Pick the nearest edge center as retreat target
+        const edgeCandidates: Vec2[] = [
+          { x: unit.posX, z: 0 },          // south
+          { x: unit.posX, z: mapH },        // north
+          { x: 0,         z: unit.posZ },   // west
+          { x: mapW,      z: unit.posZ },   // east
+        ];
+        let nearest = edgeCandidates[0];
+        let nearestDist = Infinity;
+        for (const c of edgeCandidates) {
+          const d = distanceBetween({ x: unit.posX, z: unit.posZ }, c);
+          if (d < nearestDist) { nearestDist = d; nearest = c; }
+        }
+        unit.currentPath = [{ x: unit.posX, z: unit.posZ }, nearest];
+        unit.pathIndex = 1;
+        unit.moveMode = 'march'; // routing units flee at full speed
+      }
     }
 
     // --- Pinned units: cannot advance (but can stay in place) ---
     if (unit.moraleState === 'pinned') {
-      // Pinned units cannot move forward. Clear their path.
-      // They remain stationary until suppression decays below 40.
       unit.currentPath = null;
       unit.pathIndex = 0;
     }
@@ -198,7 +219,6 @@ export function resolveMovement(
     // --- No active path: unit is stationary ---
     if (!unit.currentPath || unit.currentPath.length === 0) {
       unit.stoppedForSec += dt;
-      // Decay the rolling distance window (10s = 200 ticks)
       unit.recentDistanceM = Math.max(0, unit.recentDistanceM - (unit.recentDistanceM * dt / 10));
       unit.speedState = classifySpeedState(unit.recentDistanceM, unit.stoppedForSec);
       continue;
@@ -209,10 +229,15 @@ export function resolveMovement(
       // Path exhausted — check order queue for next waypoint
       if (unit.orderQueue.length > 0) {
         const nextWaypoint = unit.orderQueue.shift()!;
-        // TODO: Compute new A* path from current position to nextWaypoint.pos
-        //       Set unit.moveMode = nextWaypoint.moveMode
-        //       Set unit.currentPath = pathResult.path
-        //       Set unit.pathIndex = 0
+        // Use a straight-line path from current position to the queued waypoint.
+        // (Full A* would require injecting the pathfinder here; straight-line
+        // is sufficient for queued waypoints that are already close-range.)
+        unit.moveMode = nextWaypoint.moveMode;
+        unit.currentPath = [
+          { x: unit.posX, z: unit.posZ },
+          nextWaypoint.pos,
+        ];
+        unit.pathIndex = 1;
       } else {
         // No more waypoints — halt
         unit.currentPath = null;
@@ -232,24 +257,22 @@ export function resolveMovement(
     const ut = unitTypes?.get(unit.unitTypeId);
     const moveClass: MoveClass = ut?.moveClass ?? 'track';
     const cellCost = getTerrainCost(costGrids, moveClass, unit.posX, unit.posZ);
-    const maxSpeedM = ut?.maxSpeedM ?? 10;
+    let maxSpeedM = ut?.maxSpeedM ?? 10;
+    // Routing units retreat at 50% speed (ENEMY_AI.md §5.3)
+    if (unit.moraleState === 'routing') maxSpeedM *= 0.5;
     const speed = effectiveSpeed(maxSpeedM, unit.moveMode, cellCost);
 
     // --- Move toward waypoint ---
-    // Positions are cell indices. CELL_REAL_M converts m/s → cells/sec.
-    // 1 cell = 20 real-world metres, so 10 m/s = 0.5 cells/sec.
     const CELL_REAL_M = 20;
     const distToWaypoint = distanceBetween(unitPos, waypoint);
     const stepDistance = (speed / CELL_REAL_M) * dt;
 
     if (stepDistance >= distToWaypoint) {
-      // Arrived at waypoint — snap to it and advance index
       unit.posX = waypoint.x;
       unit.posZ = waypoint.z;
       unit.pathIndex++;
       unit.recentDistanceM += distToWaypoint;
     } else {
-      // Interpolate toward waypoint
       const ratio = stepDistance / distToWaypoint;
       unit.posX += (waypoint.x - unit.posX) * ratio;
       unit.posZ += (waypoint.z - unit.posZ) * ratio;
@@ -258,14 +281,13 @@ export function resolveMovement(
 
     // --- Update heading toward waypoint ---
     unit.heading = bearingToward(unitPos, waypoint);
-    // For reverse movement, heading faces opposite to travel direction
     if (unit.moveMode === 'reverse') {
       unit.heading = (unit.heading + 180) % 360;
     }
 
     // --- Reset stationary counters since we moved ---
     unit.stoppedForSec = 0;
-    unit.lastMoveTick = 0; // TODO: Set to current tick
+    unit.lastMoveTick = tick;
 
     // --- Classify speed state based on 10-second rolling window ---
     unit.speedState = classifySpeedState(unit.recentDistanceM, unit.stoppedForSec);

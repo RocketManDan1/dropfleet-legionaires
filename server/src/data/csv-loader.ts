@@ -169,7 +169,7 @@ function parseUnitRow(cols: string[], weaponTable?: Map<number, WeaponStats>): U
     swimSpeedM: int(COL.SWIM_SPD) * 50 / 300,
     moveClass: mapMoveClass(int(COL.MOVE_CLASS_ID)),
     moveClassId: int(COL.MOVE_CLASS_ID),
-    visionM: int(COL.VISION) * 50,   // CSV value × 50 = metres
+    visionM: 500 + int(COL.VISION) * 50,   // 500 m baseline + CSV value × 50
     fc: int(COL.FC),
     rf: int(COL.RF),
     stabilizer: int(COL.STABILISER),

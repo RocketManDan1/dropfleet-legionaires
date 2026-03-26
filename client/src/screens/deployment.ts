@@ -19,12 +19,18 @@ import {
   DEPLOYMENT_TIMER_SEC,
 } from '@legionaires/shared';
 
+const ZONE_FILL_Y_OFFSET = 1.6;
+const ZONE_LINE_Y_OFFSET = 1.9;
+const ZONE_MARKER_BASE_OFFSET = 1.5;
+const ZONE_MARKER_TOP_OFFSET = 6.2;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /** A unit entry in the deployment roster — tracks placement state. */
 export interface RosterEntry {
+  unitId: string;
   unitTypeId: string;
   displayName: string;
   unitClass: string;
@@ -32,7 +38,10 @@ export interface RosterEntry {
 }
 
 /** Callback fired when the player drags a unit from roster toward the map. */
-export type UnitDragCallback = (unitTypeId: string, screenX: number, screenY: number) => void;
+export type UnitDragCallback = (unitId: string, screenX: number, screenY: number) => void;
+
+/** Callback fired when the player clicks a deployed unit to undeploy it. */
+export type UnitUndeployCallback = (unitId: string) => void;
 
 /** Callback fired when the player clicks "Ready". */
 export type ReadyCallback = () => void;
@@ -157,14 +166,18 @@ function injectStyles(): void {
       background: rgba(0, 255, 65, 0.2);
     }
 
+    .deploy-unit-item-active {
+      background: rgba(0, 255, 65, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(0, 255, 65, 0.45);
+    }
+
     .deploy-unit-item-placed {
-      color: rgba(0, 255, 65, 0.4);
-      cursor: default;
-      text-decoration: line-through;
+      color: rgba(0, 255, 65, 0.55);
+      cursor: pointer;
     }
 
     .deploy-unit-item-placed:hover {
-      background: transparent;
+      background: rgba(255, 65, 54, 0.12);
     }
 
     .deploy-unit-class-badge {
@@ -248,6 +261,36 @@ function injectStyles(): void {
     .deploy-sidebar::-webkit-scrollbar-thumb {
       background: rgba(0, 255, 65, 0.3);
     }
+
+    .deploy-cursor-ghost {
+      position: fixed;
+      pointer-events: none;
+      width: 28px;
+      height: 28px;
+      border: 1px solid rgba(0, 255, 65, 0.7);
+      background: rgba(0, 255, 65, 0.14);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 18px rgba(0, 255, 65, 0.35);
+      z-index: 120;
+      display: none;
+    }
+
+    .deploy-cursor-ghost-label {
+      position: absolute;
+      top: 32px;
+      left: 50%;
+      transform: translateX(-50%);
+      white-space: nowrap;
+      color: #00ff41;
+      background: rgba(8, 10, 10, 0.86);
+      border: 1px solid rgba(0, 255, 65, 0.35);
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      padding: 2px 6px;
+      text-transform: uppercase;
+    }
   `;
   document.head.appendChild(style);
 }
@@ -270,20 +313,25 @@ export class DeploymentScreen {
   private reserveInfoEl: HTMLDivElement | null = null;
   private readyBtnEl: HTMLButtonElement | null = null;
   private instructionsEl: HTMLDivElement | null = null;
+  private cursorGhostEl: HTMLDivElement | null = null;
+  private cursorGhostLabelEl: HTMLDivElement | null = null;
 
   // State
   private roster: RosterEntry[] = [];
   private zoneVertices: Vec2[] = [];
   private reserveSlots = 0;
   private currentTimerSec: number = DEPLOYMENT_TIMER_SEC;
+  private terrainHeightSampler: ((x: number, z: number) => number) | null = null;
 
   // Callbacks
   private unitDragCb: UnitDragCallback | null = null;
+  private unitUndeployCb: UnitUndeployCallback | null = null;
   private readyCb: ReadyCallback | null = null;
 
   // Bound listener refs for cleanup
-  private boundPointerUp: ((e: PointerEvent) => void) | null = null;
-  private dragUnitTypeId: string | null = null;
+  private boundPointerMove: ((e: PointerEvent) => void) | null = null;
+  private boundPointerDown: ((e: PointerEvent) => void) | null = null;
+  private activeDeployUnitId: string | null = null;
 
   // -------------------------------------------------------------------------
   // Public API
@@ -301,6 +349,7 @@ export class DeploymentScreen {
     canvas: HTMLCanvasElement,
     zoneData: DeploymentZonePayload,
     roster: RosterEntry[] = [],
+    terrainHeightSampler?: (x: number, z: number) => number,
   ): void {
     injectStyles();
 
@@ -308,6 +357,7 @@ export class DeploymentScreen {
     this.currentTimerSec = zoneData.timeRemainingSec;
     this.reserveSlots = zoneData.reserveSlots;
     this.roster = roster.map((r) => ({ ...r }));
+    this.terrainHeightSampler = terrainHeightSampler ?? null;
 
     // Retrieve the scene from the canvas renderer
     this.scene = this._findScene(canvas);
@@ -335,6 +385,14 @@ export class DeploymentScreen {
   }
 
   /**
+   * Registers a callback invoked when a placed unit is clicked in the
+   * deployed roster section.
+   */
+  onUnitUndeploy(callback: UnitUndeployCallback): void {
+    this.unitUndeployCb = callback;
+  }
+
+  /**
    * Registers a callback invoked when the player clicks the "Ready" button,
    * signaling that they have finished placing units and want to begin
    * the mission.
@@ -358,16 +416,37 @@ export class DeploymentScreen {
    * Moves a unit from the "to place" list to the "placed" list after the
    * server confirms successful placement.
    *
-   * @param unitTypeId - The type ID of the unit that was placed.
+   * @param unitId - The unique instance ID of the unit that was placed.
    */
-  markUnitPlaced(unitTypeId: string): void {
+  markUnitPlaced(unitId: string): void {
     const entry = this.roster.find(
-      (r) => r.unitTypeId === unitTypeId && !r.placed,
+      (r) => r.unitId === unitId,
     );
     if (entry) {
       entry.placed = true;
+      if (this.activeDeployUnitId === unitId) {
+        this._clearActiveDeploySelection();
+      }
       this._renderRoster();
     }
+  }
+
+  /**
+   * Reverts optimistic placement if the server rejects DEPLOY_UNIT.
+   */
+  markUnitUnplaced(unitId: string): void {
+    const entry = this.roster.find((r) => r.unitId === unitId);
+    if (entry) {
+      entry.placed = false;
+      this._renderRoster();
+    }
+  }
+
+  /**
+   * Returns whether a unit is currently marked as placed.
+   */
+  isUnitPlaced(unitId: string): boolean {
+    return this.roster.some((r) => r.unitId === unitId && r.placed);
   }
 
   /**
@@ -420,15 +499,23 @@ export class DeploymentScreen {
     this.reserveInfoEl = null;
     this.readyBtnEl = null;
     this.instructionsEl = null;
+    this.cursorGhostEl = null;
+    this.cursorGhostLabelEl = null;
 
-    // Remove global pointer-up listener
-    if (this.boundPointerUp) {
-      window.removeEventListener('pointerup', this.boundPointerUp);
-      this.boundPointerUp = null;
+    // Remove global pointer listeners
+    if (this.boundPointerMove) {
+      window.removeEventListener('pointermove', this.boundPointerMove);
+      this.boundPointerMove = null;
     }
+    if (this.boundPointerDown) {
+      window.removeEventListener('pointerdown', this.boundPointerDown, true);
+      this.boundPointerDown = null;
+    }
+    this.activeDeployUnitId = null;
 
     // Clear callbacks
     this.unitDragCb = null;
+    this.unitUndeployCb = null;
     this.readyCb = null;
 
     this.scene = null;
@@ -463,42 +550,44 @@ export class DeploymentScreen {
   private _buildZoneOverlay(): void {
     if (!this.scene || this.zoneVertices.length < 3) return;
 
+    const vertices = this.zoneVertices.filter(
+      (v) => Number.isFinite(v.x) && Number.isFinite(v.z),
+    );
+    if (vertices.length < 3) return;
+
     this.zoneGroup = new THREE.Group();
     this.zoneGroup.name = 'deployment-zone';
 
-    // --- Fill polygon ---
-    const shape = new THREE.Shape();
-    shape.moveTo(this.zoneVertices[0].x, this.zoneVertices[0].z);
-    for (let i = 1; i < this.zoneVertices.length; i++) {
-      shape.lineTo(this.zoneVertices[i].x, this.zoneVertices[i].z);
-    }
-    shape.closePath();
-
-    const fillGeometry = new THREE.ShapeGeometry(shape);
-    // ShapeGeometry places the shape on XY; rotate to lie on XZ plane
-    fillGeometry.rotateX(-Math.PI / 2);
+    // --- Fill polygon (terrain-conforming fan triangulation for clearer ground marking) ---
+    const fillGeometry = this._buildZoneFillGeometry(vertices);
 
     const fillMaterial = new THREE.MeshBasicMaterial({
       color: 0x00ff41,
       transparent: true,
-      opacity: 0.12,
+      opacity: 0.22,
       side: THREE.DoubleSide,
+      depthTest: false,
       depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
     });
 
     const fillMesh = new THREE.Mesh(fillGeometry, fillMaterial);
-    fillMesh.position.y = 0.3; // slight offset above terrain
     fillMesh.name = 'zone-fill';
+    fillMesh.renderOrder = 2;
     this.zoneGroup.add(fillMesh);
 
     // --- Border wireframe ---
     const borderPoints: THREE.Vector3[] = [];
-    for (const v of this.zoneVertices) {
-      borderPoints.push(new THREE.Vector3(v.x, 0.5, v.z));
+    for (const v of vertices) {
+      borderPoints.push(new THREE.Vector3(v.x, this._terrainY(v.x, v.z, ZONE_LINE_Y_OFFSET), v.z));
     }
     // Close the loop
     borderPoints.push(new THREE.Vector3(
-      this.zoneVertices[0].x, 0.5, this.zoneVertices[0].z,
+      vertices[0].x,
+      this._terrainY(vertices[0].x, vertices[0].z, ZONE_LINE_Y_OFFSET),
+      vertices[0].z,
     ));
 
     const borderGeometry = new THREE.BufferGeometry().setFromPoints(borderPoints);
@@ -507,6 +596,8 @@ export class DeploymentScreen {
       transparent: true,
       opacity: 0.6,
       linewidth: 1,
+      depthTest: false,
+      depthWrite: false,
     });
 
     const borderLine = new THREE.Line(borderGeometry, borderMaterial);
@@ -514,16 +605,18 @@ export class DeploymentScreen {
     this.zoneGroup.add(borderLine);
 
     // --- Corner markers (small vertical lines at each vertex) ---
-    for (const v of this.zoneVertices) {
+    for (const v of vertices) {
       const markerPoints = [
-        new THREE.Vector3(v.x, 0.3, v.z),
-        new THREE.Vector3(v.x, 3.0, v.z),
+        new THREE.Vector3(v.x, this._terrainY(v.x, v.z, ZONE_MARKER_BASE_OFFSET), v.z),
+        new THREE.Vector3(v.x, this._terrainY(v.x, v.z, ZONE_MARKER_TOP_OFFSET), v.z),
       ];
       const markerGeo = new THREE.BufferGeometry().setFromPoints(markerPoints);
       const markerMat = new THREE.LineBasicMaterial({
         color: 0x00ff41,
         transparent: true,
         opacity: 0.8,
+        depthTest: false,
+        depthWrite: false,
       });
       const marker = new THREE.Line(markerGeo, markerMat);
       marker.name = 'zone-corner-marker';
@@ -531,15 +624,19 @@ export class DeploymentScreen {
     }
 
     // --- Animated pulse ring (pulsing circle at zone center) ---
-    const center = this._computeZoneCenter();
+    const center = this._computeZoneCenter(vertices);
     const pulsePoints: THREE.Vector3[] = [];
     const pulseSegments = 48;
-    const avgRadius = this._computeAverageRadius(center);
+    const avgRadius = this._computeAverageRadius(center, vertices);
     for (let i = 0; i <= pulseSegments; i++) {
       const angle = (i / pulseSegments) * Math.PI * 2;
       pulsePoints.push(new THREE.Vector3(
         center.x + Math.cos(angle) * avgRadius,
-        0.4,
+        this._terrainY(
+          center.x + Math.cos(angle) * avgRadius,
+          center.z + Math.sin(angle) * avgRadius,
+          ZONE_LINE_Y_OFFSET,
+        ),
         center.z + Math.sin(angle) * avgRadius,
       ));
     }
@@ -548,6 +645,8 @@ export class DeploymentScreen {
       color: 0x00ff41,
       transparent: true,
       opacity: 0.2,
+      depthTest: false,
+      depthWrite: false,
     });
     const pulseLine = new THREE.Line(pulseGeo, pulseMat);
     pulseLine.name = 'zone-pulse';
@@ -556,17 +655,43 @@ export class DeploymentScreen {
     this.scene.add(this.zoneGroup);
   }
 
+  private _buildZoneFillGeometry(vertices: Vec2[]): THREE.BufferGeometry {
+    const contour = vertices.map((v) => new THREE.Vector2(v.x, v.z));
+    const triangles = THREE.ShapeUtils.triangulateShape(contour, []);
+    const positions: number[] = [];
+
+    for (const tri of triangles) {
+      const a = vertices[tri[0]];
+      const b = vertices[tri[1]];
+      const c = vertices[tri[2]];
+
+      positions.push(a.x, this._terrainY(a.x, a.z, ZONE_FILL_Y_OFFSET), a.z);
+      positions.push(b.x, this._terrainY(b.x, b.z, ZONE_FILL_Y_OFFSET), b.z);
+      positions.push(c.x, this._terrainY(c.x, c.z, ZONE_FILL_Y_OFFSET), c.z);
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.computeVertexNormals();
+    return geo;
+  }
+
+  private _terrainY(x: number, z: number, offset: number): number {
+    if (!this.terrainHeightSampler) return offset;
+    return this.terrainHeightSampler(x, z) + offset;
+  }
+
   /**
    * Computes the centroid of the zone polygon.
    */
-  private _computeZoneCenter(): Vec2 {
+  private _computeZoneCenter(vertices: Vec2[]): Vec2 {
     let sumX = 0;
     let sumZ = 0;
-    for (const v of this.zoneVertices) {
+    for (const v of vertices) {
       sumX += v.x;
       sumZ += v.z;
     }
-    const n = this.zoneVertices.length;
+    const n = vertices.length;
     return { x: sumX / n, z: sumZ / n };
   }
 
@@ -574,14 +699,14 @@ export class DeploymentScreen {
    * Computes the average distance from the center to each vertex,
    * used as a rough radius for the pulse ring.
    */
-  private _computeAverageRadius(center: Vec2): number {
+  private _computeAverageRadius(center: Vec2, vertices: Vec2[]): number {
     let sum = 0;
-    for (const v of this.zoneVertices) {
+    for (const v of vertices) {
       const dx = v.x - center.x;
       const dz = v.z - center.z;
       sum += Math.sqrt(dx * dx + dz * dz);
     }
-    return sum / this.zoneVertices.length;
+    return sum / vertices.length;
   }
 
   // -------------------------------------------------------------------------
@@ -659,14 +784,24 @@ export class DeploymentScreen {
     this.instructionsEl = document.createElement('div');
     this.instructionsEl.className = 'deploy-instructions';
     this.instructionsEl.textContent =
-      'DRAG UNITS FROM ROSTER TO DEPLOY | CLICK READY WHEN FINISHED';
+      'CLICK UNIT TO ARM CURSOR | CLICK ZONE TO DEPLOY OR REPOSITION | CLICK DEPLOYED UNIT TO UNDEPLOY';
     this.rootEl.appendChild(this.instructionsEl);
+
+    // Cursor ghost for currently armed deployment unit
+    this.cursorGhostEl = document.createElement('div');
+    this.cursorGhostEl.className = 'deploy-cursor-ghost';
+    this.cursorGhostLabelEl = document.createElement('div');
+    this.cursorGhostLabelEl.className = 'deploy-cursor-ghost-label';
+    this.cursorGhostEl.appendChild(this.cursorGhostLabelEl);
+    this.rootEl.appendChild(this.cursorGhostEl);
 
     document.body.appendChild(this.rootEl);
 
-    // Global pointer-up listener for drag operations
-    this.boundPointerUp = (e: PointerEvent) => this._handlePointerUp(e);
-    window.addEventListener('pointerup', this.boundPointerUp);
+    // Global listeners: move updates cursor ghost, down commits placement
+    this.boundPointerMove = (e: PointerEvent) => this._handlePointerMove(e);
+    this.boundPointerDown = (e: PointerEvent) => this._handlePointerDown(e);
+    window.addEventListener('pointermove', this.boundPointerMove);
+    window.addEventListener('pointerdown', this.boundPointerDown, true);
   }
 
   // -------------------------------------------------------------------------
@@ -721,6 +856,9 @@ export class DeploymentScreen {
     item.className = isPlaced
       ? 'deploy-unit-item deploy-unit-item-placed'
       : 'deploy-unit-item';
+    if (!isPlaced && this.activeDeployUnitId === entry.unitId) {
+      item.classList.add('deploy-unit-item-active');
+    }
 
     const nameSpan = document.createElement('span');
     nameSpan.textContent = entry.displayName;
@@ -732,21 +870,15 @@ export class DeploymentScreen {
     item.appendChild(classBadge);
 
     if (!isPlaced) {
-      // Pointer-down starts a drag
-      item.addEventListener('pointerdown', (e: PointerEvent) => {
-        e.preventDefault();
-        this.dragUnitTypeId = entry.unitTypeId;
-        // Immediately notify the callback so the consumer can start
-        // showing a placement ghost on the map
-        if (this.unitDragCb) {
-          this.unitDragCb(entry.unitTypeId, e.clientX, e.clientY);
-        }
+      item.addEventListener('click', () => {
+        this.activeDeployUnitId = entry.unitId;
+        this._setCursorGhostVisible(true, entry.displayName);
+        this._renderRoster();
       });
-
-      // Pointer-move during drag continues to notify
-      item.addEventListener('pointermove', (e: PointerEvent) => {
-        if (this.dragUnitTypeId === entry.unitTypeId && this.unitDragCb) {
-          this.unitDragCb(entry.unitTypeId, e.clientX, e.clientY);
+    } else {
+      item.addEventListener('click', () => {
+        if (this.unitUndeployCb) {
+          this.unitUndeployCb(entry.unitId);
         }
       });
     }
@@ -759,11 +891,100 @@ export class DeploymentScreen {
    * The consumer's drag callback receives the final position; the consumer
    * decides whether the position is valid and sends DEPLOY_UNIT.
    */
-  private _handlePointerUp(e: PointerEvent): void {
-    if (this.dragUnitTypeId && this.unitDragCb) {
-      this.unitDragCb(this.dragUnitTypeId, e.clientX, e.clientY);
+  private _handlePointerMove(e: PointerEvent): void {
+    if (!this.cursorGhostEl || !this.activeDeployUnitId) return;
+    this.cursorGhostEl.style.left = `${e.clientX}px`;
+    this.cursorGhostEl.style.top = `${e.clientY}px`;
+  }
+
+  /**
+   * Handles global pointer-down; if a deployment unit is currently armed and
+   * the click is outside the sidebar, commit a placement attempt.
+   */
+  private _handlePointerDown(e: PointerEvent): void {
+    if (!this.activeDeployUnitId || !this.unitDragCb) return;
+
+    const target = e.target as Node | null;
+    if (target && this.sidebarEl && this.sidebarEl.contains(target)) {
+      return;
     }
-    this.dragUnitTypeId = null;
+
+    this.unitDragCb(this.activeDeployUnitId, e.clientX, e.clientY);
+    this._clearActiveDeploySelection();
+    this._renderRoster();
+  }
+
+  private _setCursorGhostVisible(visible: boolean, label?: string): void {
+    if (!this.cursorGhostEl || !this.cursorGhostLabelEl) return;
+    this.cursorGhostEl.style.display = visible ? 'block' : 'none';
+    if (label) {
+      this.cursorGhostLabelEl.textContent = label;
+    }
+  }
+
+  private _clearActiveDeploySelection(): void {
+    this.activeDeployUnitId = null;
+    this._setCursorGhostVisible(false);
+  }
+
+  /**
+   * Returns whether deployment cursor mode is active for a given unit.
+   */
+  isUnitArmedForPlacement(unitId: string): boolean {
+    return this.activeDeployUnitId === unitId;
+  }
+
+  /**
+   * Programmatically clear placement-cursor mode.
+   */
+  clearArmedUnit(): void {
+    this._clearActiveDeploySelection();
+    this._renderRoster();
+  }
+
+  /**
+   * Returns all currently placed unit ids.
+   */
+  getPlacedUnitIds(): string[] {
+    return this.roster.filter((r) => r.placed).map((r) => r.unitId);
+  }
+
+  /**
+   * Returns all currently unplaced unit ids.
+   */
+  getUnplacedUnitIds(): string[] {
+    return this.roster.filter((r) => !r.placed).map((r) => r.unitId);
+  }
+
+  /**
+   * Gets the roster display name for a unit id.
+   */
+  getUnitDisplayName(unitId: string): string {
+    return this.roster.find((r) => r.unitId === unitId)?.displayName ?? unitId;
+  }
+
+  /**
+   * True when the user has an armed unit waiting for placement click.
+   */
+  hasArmedUnit(): boolean {
+    return this.activeDeployUnitId !== null;
+  }
+
+  /**
+   * Retrieves the currently armed unit id (if any).
+   */
+  getArmedUnitId(): string | null {
+    return this.activeDeployUnitId;
+  }
+
+  /**
+   * Clears armed unit if it matches the supplied id.
+   */
+  clearArmedUnitIfMatches(unitId: string): void {
+    if (this.activeDeployUnitId === unitId) {
+      this._clearActiveDeploySelection();
+      this._renderRoster();
+    }
   }
 
   /**

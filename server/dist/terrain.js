@@ -160,13 +160,16 @@ function sampleMapBilinear(values, width, height, x, z) {
         + h01 * (1 - fx) * fz
         + h11 * fx * fz;
 }
-function generateTownAnchors(width, height, seaLevel, heightmap, slopeMap, wetnessMap, coverMap, seed) {
+function generateTownAnchors(width, height, seaLevel, heightmap, slopeMap, wetnessMap, coverMap, seed, urbanisation = 3) {
     const rng = makeSeededRandom(seed ^ 0x51f2a5d1);
     const centerX = width * 0.5;
     const centerZ = height * 0.5;
     const discRadius = Math.min(width, height) * 0.5;
     const areaFactor = (width * height) / (512 * 512);
-    const targetCount = Math.max(3, Math.min(7, Math.round(3 + areaFactor * 2)));
+    // urbanisation 0–9: 0 = 1 town (wilderness), 9 = up to 9 towns (urban)
+    const urbMin = Math.max(1, Math.floor(urbanisation / 3));
+    const urbMax = Math.max(urbMin + 1, Math.min(9, Math.round(urbanisation + 1)));
+    const targetCount = Math.max(urbMin, Math.min(urbMax, Math.round(urbMin + areaFactor * 2)));
     const minSpacing = Math.max(22, Math.min(width, height) * 0.12);
     const candidates = [];
     const attempts = Math.max(1000, width * 5);
@@ -516,9 +519,12 @@ function extractRivers(heightmap, width, height, seaLevel, batloc, seed) {
         }
         if (path.length >= 8) {
             const avgFlow = path.reduce((s, p) => s + flow[p.z * width + p.x], 0) / path.length;
-            const w = avgFlow > flowThreshold * 8 ? 'wide'
-                : avgFlow > flowThreshold * 3 ? 'river'
-                    : 'stream';
+            // wideRiver forces all rivers to 'wide' regardless of flow magnitude
+            const w = batloc.wideRiver
+                ? 'wide'
+                : avgFlow > flowThreshold * 8 ? 'wide'
+                    : avgFlow > flowThreshold * 3 ? 'river'
+                        : 'stream';
             rivers.push({ path, width: w });
         }
     }
@@ -883,9 +889,21 @@ export function generateTerrain(width = 400, height = 400, seedOrOptions) {
             hmFlatlands[i] = computeHeight(x, z, BIOME_PARAMS.flatlands, noise2D, noise2D_b, noise2D_c);
         }
     }
-    // Blend scale: large organic regions (~30% of map width)
-    const biomeScale1 = 0.0028;
-    const biomeScale2 = 0.0035;
+    // hillBaseSize 1–8 controls biome feature size.
+    // Smaller hillBaseSize → tighter, more frequent terrain changes.
+    // Larger hillBaseSize → broad, sweeping terrain regions.
+    const sizeNorm = (Math.max(1, Math.min(8, batloc.hillBaseSize)) - 1) / 7; // 0..1
+    const biomeScaleMult = 2.0 - sizeNorm * 1.5; // size=1 → 2.0×, size=8 → 0.5×
+    const biomeScale1 = 0.0028 * biomeScaleMult;
+    const biomeScale2 = 0.0035 * biomeScaleMult;
+    // hillDensity 0–10 biases the biome blend toward more flatlands (low) or
+    // more mountains/hills (high). Implemented as an additive shift on the
+    // noise field b1 that drives the mountain↔flatland distribution.
+    // density=0 → +0.20 bias (very flat), density=5 → 0 (balanced), density=10 → -0.20 (mountainous)
+    const mountainBias = (5 - Math.max(0, Math.min(10, batloc.hillDensity))) * 0.04;
+    // maxHillHeight 0–15 scales terrain amplitude above sea level.
+    // Low values produce flat plains; high values produce tall dramatic peaks.
+    const heightAmp = 0.45 + (Math.max(0, Math.min(15, batloc.maxHillHeight)) / 15) * 0.8;
     let seaLevel = (BIOME_PARAMS.mountains.seaLevel +
         BIOME_PARAMS.hills.seaLevel +
         BIOME_PARAMS.flatlands.seaLevel) / 3;
@@ -900,8 +918,10 @@ export function generateTerrain(width = 400, height = 400, seedOrOptions) {
     for (let z = 0; z < height; z++) {
         for (let x = 0; x < width; x++) {
             const i = z * width + x;
-            // Two independent low-frequency fields → 2D biome space
-            const b1 = (noiseBiome1(x * biomeScale1, z * biomeScale1) + 1) / 2;
+            // Two independent low-frequency fields → 2D biome space.
+            // mountainBias shifts b1 so hillDensity controls mountain/flatland coverage.
+            const b1raw = (noiseBiome1(x * biomeScale1, z * biomeScale1) + 1) / 2;
+            const b1 = Math.max(0, Math.min(1, b1raw + mountainBias));
             const b2 = (noiseBiome2(x * biomeScale2, z * biomeScale2) + 1) / 2;
             // Mountains: dominant where b1 is low
             const mt = smoothstep(0.45, 0.15, b1);
@@ -924,11 +944,14 @@ export function generateTerrain(width = 400, height = 400, seedOrOptions) {
             const hf2 = noise2D_c(x * 0.054 + 421.0, z * 0.054 + 811.0);
             const micro = (hf1 * 0.65 + hf2 * 0.35); // approximately -1..1
             const detailAmp = 0.018 + wMt * 0.032 + wHl * 0.015;
-            heightmap[i] = clamp01(baseHeight + micro * detailAmp);
+            // Scale terrain above seaLevel by heightAmp — low values flatten hills,
+            // high values amplify them. Clamp so we don't overflow the 0–1 range.
+            const raw = baseHeight + micro * detailAmp;
+            heightmap[i] = clamp01(seaLevel + (raw - seaLevel) * heightAmp);
         }
     }
     const { slopeMap, curvatureMap, wetnessMap, coverMap, visibilityMap, } = buildDerivedMaps(heightmap, width, height);
-    const towns = generateTownAnchors(width, height, seaLevel, heightmap, slopeMap, wetnessMap, coverMap, baseSeed);
+    const towns = generateTownAnchors(width, height, seaLevel, heightmap, slopeMap, wetnessMap, coverMap, baseSeed, batloc.urbanisation);
     const terrainTypeMap = classifyTerrainTypes(width, height, heightmap, slopeMap, wetnessMap, coverMap, seaLevel, batloc, towns);
     // ── Feature graph layers ──────────────────────────────────────────────────
     const rivers = extractRivers(heightmap, width, height, seaLevel, batloc, baseSeed);
@@ -941,7 +964,7 @@ export function generateTerrain(width = 400, height = 400, seedOrOptions) {
     return {
         width,
         height,
-        resolution: 1,
+        resolution: 1, // coordinate unit = 1 cell; real scale: 1 cell = 20m (CELL_REAL_M)
         heightmap,
         slopeMap,
         curvatureMap,

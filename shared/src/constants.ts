@@ -8,6 +8,10 @@ export const TICK_RATE_HZ = 20;
 export const TICK_MS = 50;
 export const TICKS_PER_SEC = 20;
 
+// --- World scale ---
+// Tactical positions are stored in map cells. One cell equals 20 real metres.
+export const CELL_REAL_M = 20;
+
 // --- Snapshots ---
 export const SNAPSHOT_INTERVAL_SEC = 60;
 export const SNAPSHOT_INTERVAL_TICKS = SNAPSHOT_INTERVAL_SEC * TICKS_PER_SEC;

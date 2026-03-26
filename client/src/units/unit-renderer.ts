@@ -23,6 +23,7 @@ import {
 /** All data the renderer needs to create or update a single icon. */
 export interface IconDescriptor {
   unitTypeId: string;
+  unitName?: string;
   unitClass: UnitClass;
   faction: FactionId | 'unknown';
   detectionTier: ContactTier;
@@ -58,6 +59,7 @@ const ICON_H = 80;
 const SELECTION_RING_RADIUS = 3.0;
 const SELECTION_RING_SEGMENTS = 32;
 const SELECTION_RING_COLOR = new THREE.Color(0x00ff88);
+const ICON_GLOW_COLOR = new THREE.Color(0x6fffc8);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -100,12 +102,12 @@ const UNIT_SIDC_PARTS: Record<UnitClass, [string, string]> = {
   arty_sp:              ['G', 'UCFS-------'],  // Field Artillery, SP
   arty_towed:           ['G', 'UCFT-------'],  // Field Artillery, Towed
   mortar:               ['G', 'UCFM-------'],  // Mortar
-  at_vehicle:           ['G', 'UCAAT------'],  // Anti-Tank Vehicle
+  at_vehicle:           ['G', 'UCAT-------'],  // Anti-Tank Vehicle
   aa_vehicle:           ['G', 'UCAAA------'],  // Air Defense Vehicle
   support:              ['G', 'USS--------'],  // Combat Service Support
   supply:               ['G', 'USM--------'],  // Supply / Maintenance
-  helicopter_attack:    ['A', 'MFHA-------'],  // Attack Helicopter
-  helicopter_transport: ['A', 'MFHD-------'],  // Utility / Transport Helicopter
+  helicopter_attack:    ['A', 'MHA--------'],  // Attack Helicopter
+  helicopter_transport: ['A', 'MHU--------'],  // Utility / Transport Helicopter
   fixed_wing:           ['A', 'MFF--------'],  // Fixed-Wing Aircraft
 };
 
@@ -251,6 +253,12 @@ export class UnitRenderer {
     const group = new THREE.Group();
     group.name = `unit-icon`;
 
+    // --- Selection glow (icon halo) ---
+    const glowSprite = this._createSelectionGlowSprite();
+    glowSprite.name = 'selection-glow';
+    glowSprite.visible = descriptor.isSelected;
+    group.add(glowSprite);
+
     // --- Icon sprite (health bar baked into canvas) ---
     const iconSprite = this._createIconSprite(descriptor);
     iconSprite.name = 'icon-sprite';
@@ -305,6 +313,11 @@ export class UnitRenderer {
     if (ring) {
       ring.visible = descriptor.isSelected;
     }
+
+    const glow = group.getObjectByName('selection-glow') as THREE.Sprite | undefined;
+    if (glow) {
+      glow.visible = descriptor.isSelected;
+    }
   }
 
   /**
@@ -322,6 +335,15 @@ export class UnitRenderer {
     // Dispose shared selection ring resources
     this.selectionRingGeometry.dispose();
     this.selectionRingMaterial.dispose();
+
+    if (this._placeholderTexture) {
+      this._placeholderTexture.dispose();
+      this._placeholderTexture = null;
+    }
+    if (this._selectionGlowTexture) {
+      this._selectionGlowTexture.dispose();
+      this._selectionGlowTexture = null;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -512,7 +534,8 @@ export class UnitRenderer {
       ctx.fillText(this._unitClassAbbreviation(descriptor.unitClass), cx, labelY);
       ctx.font = '8px monospace';
       ctx.fillStyle = colors.frame;
-      ctx.fillText(descriptor.unitTypeId.replace(/_/g, ' ').substring(0, 10), cx, labelY + 12);
+      const displayName = descriptor.unitName ?? descriptor.unitTypeId.replace(/_/g, ' ');
+      ctx.fillText(displayName.substring(0, 10), cx, labelY + 12);
     }
 
     return canvas;
@@ -522,7 +545,8 @@ export class UnitRenderer {
    * Maps UnitClass to a short abbreviation for DETECTED-tier display.
    */
   private _unitClassAbbreviation(unitClass: UnitClass): string {
-    // TODO: Expand with proper NATO symbol function IDs
+    // Full NATO APP-6 SIDC integration deferred to M6 (milsymbol library).
+    // Current abbreviations cover all UnitClass values for DETECTED-tier display.
     const abbreviations: Record<UnitClass, string> = {
       mbt: 'MBT',
       ifv: 'IFV',
@@ -554,6 +578,48 @@ export class UnitRenderer {
 
   /** Shared 1x1 transparent texture for budget-exceeded frames. */
   private _placeholderTexture: THREE.CanvasTexture | null = null;
+  private _selectionGlowTexture: THREE.CanvasTexture | null = null;
+
+  private _createSelectionGlowSprite(): THREE.Sprite {
+    const material = new THREE.SpriteMaterial({
+      map: this._getSelectionGlowTexture(),
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      sizeAttenuation: false,
+      blending: THREE.AdditiveBlending,
+      color: ICON_GLOW_COLOR,
+      opacity: 0.42,
+    });
+
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(0.12, 0.12, 1);
+    sprite.position.set(0, 1.5, -0.01);
+    return sprite;
+  }
+
+  private _getSelectionGlowTexture(): THREE.CanvasTexture {
+    if (this._selectionGlowTexture) {
+      return this._selectionGlowTexture;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 128;
+    const ctx = canvas.getContext('2d')!;
+
+    const grad = ctx.createRadialGradient(64, 64, 8, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(255,255,255,0.85)');
+    grad.addColorStop(0.35, 'rgba(180,255,230,0.45)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 128, 128);
+
+    this._selectionGlowTexture = new THREE.CanvasTexture(canvas);
+    this._selectionGlowTexture.minFilter = THREE.LinearFilter;
+    this._selectionGlowTexture.magFilter = THREE.LinearFilter;
+    return this._selectionGlowTexture;
+  }
 
   private _getPlaceholderTexture(): THREE.CanvasTexture {
     if (!this._placeholderTexture) {

@@ -13,6 +13,7 @@ import type {
 } from '@legionaires/shared';
 import {
   TIER_DETECTED_MIN,
+  CELL_REAL_M,
 } from '@legionaires/shared';
 import type { UnitRegistry } from '../data/unit-registry.js';
 
@@ -122,11 +123,12 @@ function attemptFire(
   if (firer.weaponCooldowns[slot] > 0) return null;
 
   // 5. Check range
-  const range = distance(firer, target);
+  const rangeCells = distance(firer, target);
+  const rangeM = rangeCells * CELL_REAL_M;
   const firerType = unitTypes?.get(firer.unitTypeId);
   const weapon = firerType?.weapons[slot] ?? null;
   const weaponMaxRange = weapon?.rangeM ?? 2000;
-  if (range > weaponMaxRange) return null;
+  if (rangeM > weaponMaxRange) return null;
 
   // 6. Check suppression threshold
   if (firer.suppressionLevel >= 40 && firer.moraleState === 'pinned') return null;
@@ -151,7 +153,7 @@ function attemptFire(
     ammoType,
     fromPos: { x: firer.posX, z: firer.posZ },
     toPos: { x: target.posX, z: target.posZ },
-    range,
+    range: rangeM,
     tick,
   };
 }

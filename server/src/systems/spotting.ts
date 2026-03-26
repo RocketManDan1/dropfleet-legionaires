@@ -36,6 +36,7 @@ import {
   LOS_SMOKE_THERMAL,
   LOS_SMOKE_BLOCK_COUNT,
   TICKS_PER_SEC,
+  CELL_REAL_M,
 } from '@legionaires/shared';
 
 import type { SpatialHash } from '../game/spatial-hash.js';
@@ -88,9 +89,12 @@ function targetSignatureMultiplier(target: UnitInstance): number {
   // Main gun firing signature: 2.0x for 1 second
   if (target.firedThisTick) return 2.0;
 
-  // Smoke: own smoke partially obscures
-  // TODO: Check if target has active smoke discharger effect
-  // if (target.hasActiveSmoke) return 0.5;
+  // Smoke discharger active: halves the signature (Spotting and Contact Model §Signature)
+  if (target.smokeRemaining != null && target.smokeRemaining < 0) {
+    // Negative smokeRemaining is our convention for "smoke is actively deployed"
+    // (set by the deploy_smoke order handler, decays over time)
+    return 0.5;
+  }
 
   switch (target.speedState) {
     case 'fast': return 1.5;
@@ -246,6 +250,7 @@ interface LOSResult {
   blocked: boolean;
   woodlandCells: number;
   partialCoverCells: number;
+  smokeCells: number;
 }
 
 function castLOS(
@@ -270,7 +275,7 @@ function castLOS(
   const oEye = oElev + observerEyeH;
   const tTop = tElev + targetTopH;
 
-  const result: LOSResult = { blocked: false, woodlandCells: 0, partialCoverCells: 0 };
+  const result: LOSResult = { blocked: false, woodlandCells: 0, partialCoverCells: 0, smokeCells: 0 };
 
   // Bresenham walk
   let dx = Math.abs(x1 - x0);
@@ -374,8 +379,18 @@ function losObstructionFactors(
     woodlandFactor *= sensorTier === 'thermal' ? LOS_ORCHARD_THERMAL : LOS_ORCHARD_OPTICAL;
   }
 
-  // Smoke not yet tracked per-mission; default 1.0
-  const smokeFactor = 1.0;
+  // Per-cell smoke tracking is not yet implemented (arrives with theater support
+  // in M6). For now, smoke factor is driven by the target's deployed smoke
+  // which is handled via targetSignatureMultiplier(). Set factor to 1.0 here.
+  // When per-cell smoke lands, count smokeCells from the ray and apply:
+  //   smokeFactor = sensorTier === 'thermal' ? LOS_SMOKE_THERMAL : LOS_SMOKE_OPTICAL
+  //   if smokeCells >= LOS_SMOKE_BLOCK_COUNT: blocked entirely
+  let smokeFactor = 1.0;
+  if (losResult.smokeCells >= LOS_SMOKE_BLOCK_COUNT) {
+    return { woodlandFactor: 0, smokeFactor: 0, isBlocked: true };
+  } else if (losResult.smokeCells >= 1) {
+    smokeFactor = sensorTier === 'thermal' ? LOS_SMOKE_THERMAL : LOS_SMOKE_OPTICAL;
+  }
 
   return { woodlandFactor, smokeFactor, isBlocked: false };
 }
@@ -419,6 +434,10 @@ export function updateSpotting(
   const allUnits = [...units.values()];
   const aliveUnits = allUnits.filter((u) => !u.isDestroyed && u.moraleState !== 'surrendered');
 
+  // Aggregate targets observed this second per owner/faction.
+  // Decay should happen once per owner after all their observers have contributed.
+  const observedByOwner = new Map<string, Set<string>>();
+
   for (const observer of aliveUnits) {
     // Get or create the contact map for this observer's owner
     let ownerContacts = contacts.get(observer.ownerId);
@@ -427,20 +446,25 @@ export function updateSpotting(
       contacts.set(observer.ownerId, ownerContacts);
     }
 
+    let ownerObservedTargets = observedByOwner.get(observer.ownerId);
+    if (!ownerObservedTargets) {
+      ownerObservedTargets = new Set<string>();
+      observedByOwner.set(observer.ownerId, ownerObservedTargets);
+    }
+
     // Look up observer's UnitType for visionM, unitClass, moveClass
     const observerType = unitTypes?.get(observer.unitTypeId);
     const observerVisionM = observerType?.visionM ?? 1500;
+    const observerVisionCells = observerVisionM / CELL_REAL_M;
     const observerClass: UnitClass = observerType?.unitClass ?? 'infantry';
     const observerMoveClass = observerType?.moveClass ?? 'leg';
     const observerSize = observerType?.size ?? 3;
     const sensorTier = getSensorTier(observerVisionM);
 
     // Use spatial hash to find candidate targets within max sensor range
+    // Positions are in grid cells; convert vision from metres to cells
     const observerPos: Vec2 = { x: observer.posX, z: observer.posZ };
-    const candidateIds = spatialHash.unitsInRange(observerPos, observerVisionM);
-
-    // Track which targets we processed this second (for decay of unobserved)
-    const observedTargetIds = new Set<string>();
+    const candidateIds = spatialHash.unitsInRange(observerPos, observerVisionCells);
 
     for (const targetId of candidateIds) {
       const target = units.get(targetId);
@@ -450,8 +474,6 @@ export function updateSpotting(
       // Skip friendly units — we don't spot our own side
       if (target.ownerId === observer.ownerId) continue;
 
-      observedTargetIds.add(targetId);
-
       // Look up target's UnitType
       const targetType = unitTypes?.get(target.unitTypeId);
       const targetSize = targetType?.size ?? 3;
@@ -460,7 +482,7 @@ export function updateSpotting(
       // --- Compute effective detection range ---
       const signatureMult = targetSignatureMultiplier(target);
       const observerMod = observerQualityMod(observer, observerMoveClass, observerClass);
-      let effectiveRange = observerVisionM * signatureMult * observerMod;
+      let effectiveRange = observerVisionCells * signatureMult * observerMod;
 
       // Apply LOS obstruction factors (woodland, smoke)
       const obstruction = losObstructionFactors(
@@ -476,7 +498,6 @@ export function updateSpotting(
       );
 
       if (obstruction.isBlocked) {
-        decayContact(ownerContacts, targetId, currentTick);
         continue;
       }
 
@@ -489,7 +510,6 @@ export function updateSpotting(
       );
 
       if (actualDistance > effectiveRange) {
-        decayContact(ownerContacts, targetId, currentTick);
         continue;
       }
 
@@ -498,9 +518,11 @@ export function updateSpotting(
         observerPos, { x: target.posX, z: target.posZ }, terrain,
         observerMoveClass, observerSize, targetMoveClass, targetSize, false,
       )) {
-        decayContact(ownerContacts, targetId, currentTick);
         continue;
       }
+
+      // This target is truly observed (range + LOS) by this owner this second.
+      ownerObservedTargets.add(targetId);
 
       // --- Radar special case ---
       // Radar: moving target -> instantly set to floor of DETECTED (25)
@@ -559,10 +581,13 @@ export function updateSpotting(
       contact.lostAt = null;
       updateContactPosition(contact, target);
     }
+  }
 
-    // --- Decay contacts for targets NOT observed this second ---
-    for (const [targetId, contact] of ownerContacts) {
-      if (observedTargetIds.has(targetId)) continue;
+  // --- Decay contacts once per owner for targets not observed this second ---
+  for (const [ownerId, ownerContacts] of contacts) {
+    const observedTargets = observedByOwner.get(ownerId) ?? new Set<string>();
+    for (const [targetId] of ownerContacts) {
+      if (observedTargets.has(targetId)) continue;
       decayContact(ownerContacts, targetId, currentTick);
     }
   }
@@ -601,8 +626,11 @@ function createContact(
  */
 function updateContactPosition(contact: ContactEntry, target: UnitInstance): void {
   if (contact.detectionTier === 'SUSPECTED') {
-    const jitterX = (Math.random() - 0.5) * 100;
-    const jitterZ = (Math.random() - 0.5) * 100;
+    // Jitter ±50m. Positions are in cells (1 cell = CELL_REAL_M metres),
+    // so 50m jitter = 50 / CELL_REAL_M cells = ±2.5 cells at 20 m/cell.
+    const jitterCells = 50 / CELL_REAL_M;
+    const jitterX = (Math.random() - 0.5) * 2 * jitterCells;
+    const jitterZ = (Math.random() - 0.5) * 2 * jitterCells;
     contact.estimatedPos = { x: target.posX + jitterX, z: target.posZ + jitterZ };
     contact.estimatedCategory = null;
     contact.estimatedTypeId = null;
@@ -630,10 +658,14 @@ function decayContact(
   const contact = ownerContacts.get(targetId);
   if (!contact) return;
 
-  // Already lost — check if it should be removed entirely
+  // Already lost — remove entirely after LOST_DISPLAY_FADE_SEC (60s)
   if (contact.detectionTier === 'LOST') {
-    // TODO: Check if LOST_DISPLAY_FADE_SEC (60s) has elapsed since lostAt
-    //       If so, remove the contact from the map entirely.
+    if (contact.lostAt !== null) {
+      const elapsedSec = (currentTick - contact.lostAt) / TICKS_PER_SEC;
+      if (elapsedSec >= LOST_DISPLAY_FADE_SEC) {
+        ownerContacts.delete(targetId);
+      }
+    }
     return;
   }
 

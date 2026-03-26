@@ -1,6 +1,7 @@
 export declare const TICK_RATE_HZ = 20;
 export declare const TICK_MS = 50;
 export declare const TICKS_PER_SEC = 20;
+export declare const CELL_REAL_M = 20;
 export declare const SNAPSHOT_INTERVAL_SEC = 60;
 export declare const SNAPSHOT_INTERVAL_TICKS: number;
 export declare const DISCONNECT_GRACE_SEC = 300;

@@ -59,7 +59,7 @@ export interface OrderMessage {
 export interface DeployUnitMessage {
   type: 'DEPLOY_UNIT';
   payload: {
-    unitTypeId: string;
+    unitId: string;
     posX: number;
     posZ: number;
     heading: number;
@@ -68,6 +68,11 @@ export interface DeployUnitMessage {
 
 export interface DeployReadyMessage {
   type: 'DEPLOY_READY';
+  payload: Record<string, never>;
+}
+
+export interface AARAckMessage {
+  type: 'AAR_ACK';
   payload: Record<string, never>;
 }
 
@@ -97,6 +102,7 @@ export type ClientMessage =
   | OrderMessage
   | DeployUnitMessage
   | DeployReadyMessage
+  | AARAckMessage
   | TheaterSupportMessage
   | ChatMessage
   | DisconnectGracefulMessage;
@@ -123,6 +129,8 @@ export interface PongPayload {
 export interface UnitSnapshot {
   unitId: string;
   unitTypeId: string;
+  unitName?: string;
+  unitClass?: string;
   ownerId: string;
   posX: number;
   posZ: number;
@@ -317,6 +325,14 @@ export interface DeploymentZonePayload {
   reserveSlots: number;
 }
 
+export interface DeployUnitResultPayload {
+  unitId: string;
+  success: boolean;
+  reason?: string;
+  posX?: number;
+  posZ?: number;
+}
+
 // --- After Action Report ---
 
 export interface AARPlayerResult {
@@ -387,6 +403,7 @@ export type ServerMessage =
   | { type: 'ORDER_ACK';         payload: OrderAckPayload }
   | { type: 'MISSION_PHASE';     payload: MissionPhasePayload }
   | { type: 'DEPLOYMENT_ZONE';   payload: DeploymentZonePayload }
+  | { type: 'DEPLOY_UNIT_RESULT'; payload: DeployUnitResultPayload }
   | { type: 'AAR_DATA';          payload: AARPayload }
   | { type: 'ERROR';             payload: ErrorPayload }
   | { type: 'PLAYER_STATUS';     payload: PlayerInfo }

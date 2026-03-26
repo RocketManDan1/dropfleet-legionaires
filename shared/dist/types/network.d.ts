@@ -43,7 +43,7 @@ export interface OrderMessage {
 export interface DeployUnitMessage {
     type: 'DEPLOY_UNIT';
     payload: {
-        unitTypeId: string;
+        unitId: string;
         posX: number;
         posZ: number;
         heading: number;
@@ -51,6 +51,10 @@ export interface DeployUnitMessage {
 }
 export interface DeployReadyMessage {
     type: 'DEPLOY_READY';
+    payload: Record<string, never>;
+}
+export interface AARAckMessage {
+    type: 'AAR_ACK';
     payload: Record<string, never>;
 }
 export interface TheaterSupportMessage {
@@ -71,7 +75,7 @@ export interface DisconnectGracefulMessage {
     type: 'DISCONNECT_GRACEFUL';
     payload: Record<string, never>;
 }
-export type ClientMessage = AuthMessage | JoinMissionMessage | PingMessage | OrderMessage | DeployUnitMessage | DeployReadyMessage | TheaterSupportMessage | ChatMessage | DisconnectGracefulMessage;
+export type ClientMessage = AuthMessage | JoinMissionMessage | PingMessage | OrderMessage | DeployUnitMessage | DeployReadyMessage | AARAckMessage | TheaterSupportMessage | ChatMessage | DisconnectGracefulMessage;
 export interface AuthResultPayload {
     success: boolean;
     playerId?: string;
@@ -86,6 +90,8 @@ export interface PongPayload {
 export interface UnitSnapshot {
     unitId: string;
     unitTypeId: string;
+    unitName?: string;
+    unitClass?: string;
     ownerId: string;
     posX: number;
     posZ: number;
@@ -247,6 +253,13 @@ export interface DeploymentZonePayload {
     timeRemainingSec: number;
     reserveSlots: number;
 }
+export interface DeployUnitResultPayload {
+    unitId: string;
+    success: boolean;
+    reason?: string;
+    posX?: number;
+    posZ?: number;
+}
 export interface AARPlayerResult {
     playerId: string;
     playerName: string;
@@ -301,6 +314,9 @@ export type ServerMessage = {
 } | {
     type: 'DEPLOYMENT_ZONE';
     payload: DeploymentZonePayload;
+} | {
+    type: 'DEPLOY_UNIT_RESULT';
+    payload: DeployUnitResultPayload;
 } | {
     type: 'AAR_DATA';
     payload: AARPayload;

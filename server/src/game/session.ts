@@ -21,12 +21,24 @@ import type {
   CostGrid,
   MoveClass,
 } from '@legionaires/shared';
+import type {
+  InfluenceMaps,
+  MissionPhaseWire,
+  AARPayload,
+  AARPlayerResult,
+  MissionType,
+  DifficultyTier,
+  DeploymentZonePayload,
+} from '@legionaires/shared';
 import {
   DISCONNECT_GRACE_SEC,
   DISCONNECT_GRACE_TICKS,
   TICKS_PER_SEC,
   SNAPSHOT_INTERVAL_TICKS,
   IMPASSABLE_THRESHOLD,
+  DEPLOYMENT_TIMER_SEC,
+  SPATIAL_HASH_CELL_SIZE,
+  CELL_REAL_M,
 } from '@legionaires/shared';
 
 import { TickLoop, type LoopState } from './tick-loop.js';
@@ -34,6 +46,13 @@ import { SpatialHash } from './spatial-hash.js';
 import type { UnitRegistry } from '../data/unit-registry.js';
 import type { TerrainData } from '../terrain.js';
 import { TerrainType, TERRAIN_MOVE_COST } from '../terrain-types.js';
+import { MissionLifecycle } from '../mission/lifecycle.js';
+import { DeploymentManager } from '../mission/deployment.js';
+import { ObjectiveTracker } from '../mission/objectives.js';
+import { StrategicAI } from '../ai/strategic.js';
+import { PlatoonBehaviorTree } from '../ai/platoon-bt.js';
+import { InfluenceMapManager } from '../ai/influence-map.js';
+import { serializeServerMessage } from '../network/protocol.js';
 
 // ---------------------------------------------------------------------------
 // Player connection wrapper — holds the WebSocket and order buffer
@@ -49,6 +68,7 @@ export interface PlayerConnection {
   graceExpiresAtTick: number | null;
   frozenUnitIds: string[];
   readyForDeployment: boolean;
+  acknowledgedAAR: boolean;
 
   /** Inbound order buffer — filled by the WS message handler, drained each tick. */
   orderBuffer: ResolvedOrder[];
@@ -77,6 +97,7 @@ export function createPlayerConnection(
     graceExpiresAtTick: null,
     frozenUnitIds: [],
     readyForDeployment: false,
+    acknowledgedAAR: false,
     orderBuffer,
     drainOrderBuffer(): ResolvedOrder[] {
       const orders = [...orderBuffer];
@@ -178,6 +199,18 @@ export class GameSession {
   // --- Cost grids (one per MoveClass, built at session creation) ------------
   private costGrids: Map<MoveClass, CostGrid> = new Map();
 
+  // --- M3: Mission systems --------------------------------------------------
+  private lifecycle: MissionLifecycle | null = null;
+  private deploymentMgr: DeploymentManager | null = null;
+  private objectiveTracker: ObjectiveTracker | null = null;
+  private strategicAI: StrategicAI | null = null;
+  private platoonBT: PlatoonBehaviorTree | null = null;
+  private influenceMapMgr: InfluenceMapManager | null = null;
+  private cachedInfluenceMaps: InfluenceMaps | null = null;
+  private aiFactionId: string = 'ai';
+  private missionType: MissionType = 'defend';
+  private missionDifficulty: DifficultyTier = 'easy';
+
   // --- Lifecycle timestamps -------------------------------------------------
   readonly createdAt: number;
   private missionStartTick: number = 0;
@@ -199,7 +232,7 @@ export class GameSession {
     this.createdAt = Date.now();
 
     // Initialize spatial hash with map dimensions
-    this.spatialHash = new SpatialHash(terrain.width, terrain.height);
+    this.spatialHash = new SpatialHash(terrain.width, terrain.height, SPATIAL_HASH_CELL_SIZE / CELL_REAL_M);
 
     // Build cost grids (one per ground MoveClass)
     this.buildCostGrids();
@@ -444,6 +477,189 @@ export class GameSession {
 
   getScore(): ScoreState {
     return this.score;
+  }
+
+  // =========================================================================
+  // M3: Mission system accessors (used by TickLoop, server index)
+  // =========================================================================
+
+  getLifecycle(): MissionLifecycle | null { return this.lifecycle; }
+  setLifecycle(lc: MissionLifecycle): void { this.lifecycle = lc; }
+
+  getDeploymentManager(): DeploymentManager | null { return this.deploymentMgr; }
+  setDeploymentManager(dm: DeploymentManager): void { this.deploymentMgr = dm; }
+
+  getObjectiveTracker(): ObjectiveTracker | null { return this.objectiveTracker; }
+  setObjectiveTracker(ot: ObjectiveTracker): void {
+    this.objectiveTracker = ot;
+    // Keep mission snapshot/objective totals in sync with the active tracker.
+    this.objectives = ot.getAll();
+    this.score.objectivesTotal = this.objectives.length;
+  }
+
+  getStrategicAI(): StrategicAI | null { return this.strategicAI; }
+  setStrategicAI(ai: StrategicAI): void { this.strategicAI = ai; }
+
+  getPlatoonBT(): PlatoonBehaviorTree | null { return this.platoonBT; }
+  setPlatoonBT(bt: PlatoonBehaviorTree): void { this.platoonBT = bt; }
+
+  getInfluenceMapManager(): InfluenceMapManager | null { return this.influenceMapMgr; }
+  setInfluenceMapManager(mgr: InfluenceMapManager): void { this.influenceMapMgr = mgr; }
+
+  getPlatoons(): Map<string, PlatoonState> { return this.platoons; }
+
+  getAiFactionId(): string { return this.aiFactionId; }
+  setAiFactionId(id: string): void { this.aiFactionId = id; }
+
+  getMissionType(): MissionType { return this.missionType; }
+  setMissionType(mt: MissionType): void { this.missionType = mt; }
+
+  getMissionDifficulty(): DifficultyTier { return this.missionDifficulty; }
+  setMissionDifficulty(d: DifficultyTier): void { this.missionDifficulty = d; }
+
+  getInfluenceMaps(): InfluenceMaps | null { return this.cachedInfluenceMaps; }
+  setInfluenceMaps(maps: InfluenceMaps): void { this.cachedInfluenceMaps = maps; }
+
+  /**
+   * Called by the tick loop when the lifecycle state machine fires a transition.
+   * Broadcasts MISSION_PHASE to all connected players and handles phase-specific
+   * side effects (e.g. generating AAR data on transition to 'aar').
+   */
+  onPhaseTransition(newPhase: MissionPhaseInternal, reason: string, tick: number): void {
+    const PHASE_TO_WIRE: Record<MissionPhaseInternal, MissionPhaseWire> = {
+      created: 'briefing',
+      deployment: 'deployment',
+      live: 'live',
+      extraction: 'extraction',
+      aar: 'ended',
+      closed: 'ended',
+    };
+    const wirePhase = PHASE_TO_WIRE[newPhase];
+    const missionTimeSec = tick / TICKS_PER_SEC;
+
+    // Broadcast phase change to all connected players
+    for (const [, conn] of this.players) {
+      if (!conn.isConnected || !conn.ws) continue;
+      try {
+        conn.ws.send(serializeServerMessage(
+          { type: 'MISSION_PHASE', payload: { phase: wirePhase, missionTimeSec, message: reason } },
+          tick,
+        ));
+      } catch { /* socket may be closing */ }
+    }
+
+    // Phase-specific side effects
+    if (newPhase === 'live') {
+      this.missionStartTick = tick;
+      // Auto-deploy any unplaced units when deployment ends
+      if (this.deploymentMgr) {
+        for (const [, unit] of this.unitRegistry) {
+          if (unit.ownerId === this.aiFactionId) continue;
+          if (!this.deploymentMgr.hasPlacedUnit(unit.instanceId)) {
+            const result = this.deploymentMgr.autoDeploy(unit.instanceId);
+            if (result.success) {
+              unit.posX = result.position.x;
+              unit.posZ = result.position.z;
+              this.spatialHash.insert(unit.instanceId, unit.posX, unit.posZ);
+            }
+          }
+        }
+      }
+    }
+
+    if (newPhase === 'aar') {
+      for (const [, conn] of this.players) {
+        conn.acknowledgedAAR = false;
+      }
+      this.broadcastAAR(tick);
+    }
+
+    if (newPhase === 'closed') {
+      this.tickLoop.stop();
+    }
+  }
+
+  /**
+   * Build and broadcast the After Action Report to all connected players.
+   */
+  private broadcastAAR(tick: number): void {
+    const durationSec = (tick - this.missionStartTick) / TICKS_PER_SEC;
+    const score = this.score;
+
+    // Determine result
+    let result: 'victory' | 'defeat' | 'draw' = 'draw';
+    const objTracker = this.objectiveTracker;
+    if (objTracker && objTracker.allPrimaryComplete()) {
+      result = 'victory';
+    } else {
+      // Check if all player units destroyed
+      let anyAlive = false;
+      for (const [, unit] of this.unitRegistry) {
+        if (!unit.isDestroyed && unit.ownerId !== this.aiFactionId) {
+          anyAlive = true;
+          break;
+        }
+      }
+      if (!anyAlive) result = 'defeat';
+    }
+
+    // Build per-player results
+    const playerResults: AARPlayerResult[] = [];
+    for (const [playerId, conn] of this.players) {
+      let unitsDeployed = 0;
+      let unitsDestroyed = 0;
+      let killsScored = 0;
+
+      for (const [, unit] of this.unitRegistry) {
+        if (unit.ownerId === playerId) {
+          unitsDeployed++;
+          if (unit.isDestroyed) unitsDestroyed++;
+        }
+      }
+
+      // SP computation (simplified — proper version in campaign layer)
+      const spBase = result === 'victory' ? 100 : result === 'draw' ? 50 : 25;
+      const spBonusZeroKIA = unitsDestroyed === 0 ? 25 : 0;
+
+      playerResults.push({
+        playerId,
+        playerName: conn.playerName,
+        battalionName: conn.battalionId,
+        joinedAtSec: 0,
+        participationPct: 100 / Math.max(1, this.players.size),
+        unitsDeployed,
+        unitsDestroyed,
+        killsScored,
+        spBase,
+        spBonusZeroKIA,
+        spBonusSecondary: 0,
+        spBonusSpeed: 0,
+        spTotal: spBase + spBonusZeroKIA,
+      });
+    }
+
+    const aarPayload: AARPayload = {
+      missionId: this.sessionId,
+      result,
+      missionType: this.missionType,
+      difficulty: this.missionDifficulty,
+      durationSec,
+      playerResults,
+      totalEnemiesDestroyed: score.enemiesDestroyed,
+      totalFriendlyCasualties: score.friendlyCasualties,
+      influenceBefore: 50,
+      influenceAfter: result === 'victory' ? 65 : result === 'defeat' ? 35 : 50,
+    };
+
+    for (const [, conn] of this.players) {
+      if (!conn.isConnected || !conn.ws) continue;
+      try {
+        conn.ws.send(serializeServerMessage(
+          { type: 'AAR_DATA', payload: aarPayload },
+          tick,
+        ));
+      } catch { /* socket may be closing */ }
+    }
   }
 
   // --- Transient shot/damage data ---

@@ -11,6 +11,7 @@ import type {
 import {
   TIER_SUSPECTED_MAX, TIER_DETECTED_MIN, TIER_CONFIRMED_MIN,
 } from '@legionaires/shared';
+import type { UnitRegistry } from '../data/unit-registry.js';
 
 /**
  * Parse a raw WebSocket message string into a typed ClientMessage.
@@ -24,7 +25,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     // Validate known message types
     const validTypes = [
       'AUTH', 'JOIN_MISSION', 'PING', 'ORDER', 'DEPLOY_UNIT',
-      'DEPLOY_READY', 'THEATER_SUPPORT', 'CHAT', 'DISCONNECT_GRACEFUL',
+      'DEPLOY_READY', 'AAR_ACK', 'THEATER_SUPPORT', 'CHAT', 'DISCONNECT_GRACEFUL',
     ];
     if (!validTypes.includes(envelope.type)) return null;
 
@@ -55,13 +56,14 @@ export function filterUnitsForPlayer(
   playerId: string,
   units: Map<string, UnitInstance>,
   contacts: Map<string, ContactEntry>,
+  registry?: UnitRegistry,
 ): UnitSnapshot[] {
   const snapshots: UnitSnapshot[] = [];
 
   for (const [_id, unit] of units) {
     if (unit.ownerId === playerId) {
       // Full state for own units
-      snapshots.push(unitToFullSnapshot(unit));
+      snapshots.push(unitToFullSnapshot(unit, registry));
     }
     // Enemy units are NOT sent as UnitSnapshots — they come via ContactSnapshots
   }
@@ -102,10 +104,13 @@ export function filterContactsForPlayer(
 /**
  * Convert a full UnitInstance to a UnitSnapshot for the owning player.
  */
-function unitToFullSnapshot(unit: UnitInstance): UnitSnapshot {
+function unitToFullSnapshot(unit: UnitInstance, registry?: UnitRegistry): UnitSnapshot {
+  const unitType = registry?.get(unit.unitTypeId);
   return {
     unitId: unit.instanceId,
     unitTypeId: unit.unitTypeId,
+    unitName: unitType?.name,
+    unitClass: unitType?.unitClass,
     ownerId: unit.ownerId,
     posX: unit.posX,
     posZ: unit.posZ,

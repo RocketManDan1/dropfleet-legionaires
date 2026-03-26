@@ -33,6 +33,8 @@ export interface ClientUnit {
   ownerId: string;
   /** Faction of the owning player. */
   faction: FactionId;
+  /** Display name from unit type registry. */
+  unitName?: string;
   /** Unit classification for icon rendering. */
   unitClass: UnitClass;
   /** Current world position X (metres). */
@@ -113,6 +115,17 @@ export class UnitManager {
   /** Local player's ID (set on auth). */
   private localPlayerId: string = '';
 
+  /** Terrain height sampler for grounding icons to terrain. */
+  private terrainHeightSampler: ((x: number, z: number) => number) | null = null;
+
+  /** Base sprite width scale at close camera distance. */
+  private static readonly ICON_SCALE_NEAR = 0.08;
+  /** Base sprite width scale at far camera distance. */
+  private static readonly ICON_SCALE_FAR = 0.046;
+  /** Camera distances (world units) used for icon scaling interpolation. */
+  private static readonly ICON_SCALE_DIST_NEAR = 70;
+  private static readonly ICON_SCALE_DIST_FAR = 420;
+
   constructor(scene: THREE.Scene, camera: THREE.Camera) {
     this.scene = scene;
     this.camera = camera;
@@ -129,6 +142,11 @@ export class UnitManager {
   setLocalPlayer(playerId: string, faction: FactionId): void {
     this.localPlayerId = playerId;
     this.localFaction = faction;
+  }
+
+  /** Sets terrain sampler used to keep icons above terrain surface. */
+  setTerrainHeightSampler(sampler: ((x: number, z: number) => number) | null): void {
+    this.terrainHeightSampler = sampler;
   }
 
   // -------------------------------------------------------------------------
@@ -181,8 +199,7 @@ export class UnitManager {
       if (delta.destroyed !== undefined) unit.isDestroyed = delta.destroyed;
 
       // Update scene position
-      unit.sceneGroup.position.set(unit.posX, 0, unit.posZ);
-      // TODO: Get terrain height at position and add Y offset
+      unit.sceneGroup.position.set(unit.posX, this._groundY(unit.posX, unit.posZ), unit.posZ);
     }
   }
 
@@ -214,7 +231,11 @@ export class UnitManager {
           if (delta.unitClass !== undefined) contact.unitClass = delta.unitClass;
           if (delta.heading !== undefined) contact.heading = delta.heading;
           if (delta.lastSeenTick !== undefined) contact.lastSeenTick = delta.lastSeenTick;
-          contact.sceneGroup.position.set(contact.posX, 0, contact.posZ);
+          contact.sceneGroup.position.set(
+            contact.posX,
+            this._groundY(contact.posX, contact.posZ),
+            contact.posZ,
+          );
           break;
         }
 
@@ -237,7 +258,8 @@ export class UnitManager {
 
     const descriptor: IconDescriptor = {
       unitTypeId: snapshot.unitTypeId,
-      unitClass: this._inferUnitClass(snapshot.unitTypeId),
+      unitName: snapshot.unitName,
+      unitClass: (snapshot.unitClass as UnitClass) ?? this._inferUnitClass(snapshot.unitTypeId),
       faction: this.localFaction,
       detectionTier: 'CONFIRMED', // own units are always fully known
       crewCurrent: snapshot.crewCurrent,
@@ -247,7 +269,11 @@ export class UnitManager {
     };
 
     const group = this.renderer.createIcon(descriptor);
-    group.position.set(snapshot.posX, 0, snapshot.posZ);
+    group.position.set(
+      snapshot.posX,
+      this._groundY(snapshot.posX, snapshot.posZ),
+      snapshot.posZ,
+    );
     group.name = `unit-${snapshot.unitId}`;
     this.scene.add(group);
 
@@ -256,6 +282,7 @@ export class UnitManager {
       unitTypeId: snapshot.unitTypeId,
       ownerId: snapshot.ownerId,
       faction: this.localFaction,
+      unitName: snapshot.unitName,
       unitClass: descriptor.unitClass,
       posX: snapshot.posX,
       posZ: snapshot.posZ,
@@ -277,9 +304,18 @@ export class UnitManager {
   addContact(snapshot: ContactSnapshot): void {
     if (this.contacts.has(snapshot.contactId)) return;
 
-    // Determine enemy faction from contact data
-    // TODO: Server should send faction with contacts; default to 'unknown' for now
-    const enemyFaction: FactionId | 'unknown' = 'unknown';
+    // Infer enemy faction from contact data: at CONFIRMED tier the unitClass
+    // field carries the unitTypeId which encodes faction. At lower tiers we
+    // mark as 'unknown' which renders the NATO Unknown affiliation frame.
+    let enemyFaction: FactionId | 'unknown' = 'unknown';
+    if (snapshot.tierLabel === 'CONFIRMED' && snapshot.unitClass) {
+      const cls = snapshot.unitClass.toLowerCase();
+      if (cls.includes('ataxian') || cls.startsWith('ax_')) {
+        enemyFaction = 'ataxian';
+      } else if (cls.includes('khroshi') || cls.startsWith('ks_')) {
+        enemyFaction = 'khroshi';
+      }
+    }
 
     const descriptor: IconDescriptor = {
       unitTypeId: snapshot.contactId, // contacts may not have a type yet
@@ -302,7 +338,7 @@ export class UnitManager {
       displayZ += (Math.random() - 0.5) * 100;
     }
 
-    group.position.set(displayX, 0, displayZ);
+    group.position.set(displayX, this._groundY(displayX, displayZ), displayZ);
     group.name = `contact-${snapshot.contactId}`;
     this.scene.add(group);
 
@@ -357,6 +393,13 @@ export class UnitManager {
     this.contacts.clear();
 
     this.selectedIds.clear();
+  }
+
+  /** Sets unit group visibility by unit id. */
+  setUnitVisible(unitId: string, visible: boolean): void {
+    const unit = this.units.get(unitId);
+    if (!unit) return;
+    unit.sceneGroup.visible = visible;
   }
 
   // -------------------------------------------------------------------------
@@ -521,7 +564,7 @@ export class UnitManager {
       if (unit.ownerId !== this.localPlayerId) continue;
 
       // Project world position to screen
-      tempVec.set(unit.posX, 0, unit.posZ);
+      tempVec.set(unit.posX, this._groundY(unit.posX, unit.posZ), unit.posZ);
       tempVec.project(this.camera);
 
       const screenX = (tempVec.x * 0.5 + 0.5) * window.innerWidth;
@@ -548,8 +591,10 @@ export class UnitManager {
 
     // Update icon visuals for each unit
     for (const unit of this.units.values()) {
+      unit.sceneGroup.position.set(unit.posX, this._groundY(unit.posX, unit.posZ), unit.posZ);
       this.renderer.updateIcon(unit.sceneGroup, {
         unitTypeId: unit.unitTypeId,
+        unitName: unit.unitName,
         unitClass: unit.unitClass,
         faction: unit.faction,
         detectionTier: 'CONFIRMED',
@@ -558,10 +603,13 @@ export class UnitManager {
         isSelected: unit.isSelected,
         heading: unit.heading,
       });
+
+      this._updateIconScale(unit.sceneGroup, unit.posX, unit.posZ, unit.isSelected);
     }
 
     // Update contact visuals
     for (const contact of this.contacts.values()) {
+      contact.sceneGroup.position.set(contact.posX, this._groundY(contact.posX, contact.posZ), contact.posZ);
       this.renderer.updateIcon(contact.sceneGroup, {
         unitTypeId: contact.contactId,
         unitClass: (contact.unitClass as UnitClass) ?? 'infantry',
@@ -572,6 +620,8 @@ export class UnitManager {
         isSelected: contact.isSelected,
         heading: contact.heading ?? 0,
       });
+
+      this._updateIconScale(contact.sceneGroup, contact.posX, contact.posZ, false);
     }
   }
 
@@ -661,5 +711,38 @@ export class UnitManager {
     if (id.includes('SUPPORT')) return 'support';
 
     return 'infantry';
+  }
+
+  private _updateIconScale(group: THREE.Group, x: number, z: number, isSelected: boolean): void {
+    const icon = group.getObjectByName('icon-sprite') as THREE.Sprite | undefined;
+    if (!icon) return;
+
+    const dx = this.camera.position.x - x;
+    const dy = this.camera.position.y;
+    const dz = this.camera.position.z - z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+    const t = THREE.MathUtils.clamp(
+      (dist - UnitManager.ICON_SCALE_DIST_NEAR)
+      / (UnitManager.ICON_SCALE_DIST_FAR - UnitManager.ICON_SCALE_DIST_NEAR),
+      0,
+      1,
+    );
+    const width = THREE.MathUtils.lerp(UnitManager.ICON_SCALE_NEAR, UnitManager.ICON_SCALE_FAR, t);
+    const selectedBoost = isSelected ? 1.08 : 1.0;
+    const scaledWidth = width * selectedBoost;
+
+    icon.scale.set(scaledWidth, scaledWidth * (80 / 64), 1);
+
+    const glow = group.getObjectByName('selection-glow') as THREE.Sprite | undefined;
+    if (glow) {
+      const glowScale = scaledWidth * 1.45;
+      glow.scale.set(glowScale, glowScale, 1);
+    }
+  }
+
+  private _groundY(x: number, z: number): number {
+    if (!this.terrainHeightSampler) return 0;
+    return this.terrainHeightSampler(x, z);
   }
 }

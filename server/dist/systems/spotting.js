@@ -4,7 +4,7 @@
 // Runs every second (tick % 20 === 0). Pairwise LOS and accumulator updates.
 // Milestone 2 scaffold
 // ============================================================================
-import { BASE_ACCUMULATION_RATE, DECAY_RATE_PER_SEC, TIER_SUSPECTED_MIN, TIER_SUSPECTED_MAX, TIER_DETECTED_MIN, TIER_DETECTED_MAX, TIER_CONFIRMED_MIN, SIZE_ZERO_VISION_CAP, THERMAL_VISION_THRESHOLD, RADAR_VISION_THRESHOLD, LOS_FOREST_OPTICAL, LOS_FOREST_THERMAL, LOS_ORCHARD_OPTICAL, LOS_ORCHARD_THERMAL, } from '@legionaires/shared';
+import { BASE_ACCUMULATION_RATE, DECAY_RATE_PER_SEC, TIER_SUSPECTED_MIN, TIER_SUSPECTED_MAX, TIER_DETECTED_MIN, TIER_DETECTED_MAX, TIER_CONFIRMED_MIN, SIZE_ZERO_VISION_CAP, LOST_DISPLAY_FADE_SEC, THERMAL_VISION_THRESHOLD, RADAR_VISION_THRESHOLD, LOS_FOREST_OPTICAL, LOS_FOREST_THERMAL, LOS_ORCHARD_OPTICAL, LOS_ORCHARD_THERMAL, LOS_SMOKE_OPTICAL, LOS_SMOKE_THERMAL, LOS_SMOKE_BLOCK_COUNT, TICKS_PER_SEC, CELL_REAL_M, } from '@legionaires/shared';
 // ---------------------------------------------------------------------------
 // Sensor tier classification
 // ---------------------------------------------------------------------------
@@ -50,9 +50,12 @@ function targetSignatureMultiplier(target) {
     // Main gun firing signature: 2.0x for 1 second
     if (target.firedThisTick)
         return 2.0;
-    // Smoke: own smoke partially obscures
-    // TODO: Check if target has active smoke discharger effect
-    // if (target.hasActiveSmoke) return 0.5;
+    // Smoke discharger active: halves the signature (Spotting and Contact Model §Signature)
+    if (target.smokeRemaining != null && target.smokeRemaining < 0) {
+        // Negative smokeRemaining is our convention for "smoke is actively deployed"
+        // (set by the deploy_smoke order handler, decays over time)
+        return 0.5;
+    }
     switch (target.speedState) {
         case 'fast': return 1.5;
         case 'slow': return 1.0;
@@ -194,7 +197,7 @@ function castLOS(observerPos, targetPos, observerEyeH, targetTopH, terrain) {
     const tElev = getElevation(targetPos.x, targetPos.z, terrain.heightmap, w, h, resolution);
     const oEye = oElev + observerEyeH;
     const tTop = tElev + targetTopH;
-    const result = { blocked: false, woodlandCells: 0, partialCoverCells: 0 };
+    const result = { blocked: false, woodlandCells: 0, partialCoverCells: 0, smokeCells: 0 };
     // Bresenham walk
     let dx = Math.abs(x1 - x0);
     let dz = Math.abs(z1 - z0);
@@ -273,8 +276,19 @@ function losObstructionFactors(observer, target, sensorTier, terrain, observerMo
     if (losResult.partialCoverCells >= 1) {
         woodlandFactor *= sensorTier === 'thermal' ? LOS_ORCHARD_THERMAL : LOS_ORCHARD_OPTICAL;
     }
-    // Smoke not yet tracked per-mission; default 1.0
-    const smokeFactor = 1.0;
+    // Per-cell smoke tracking is not yet implemented (arrives with theater support
+    // in M6). For now, smoke factor is driven by the target's deployed smoke
+    // which is handled via targetSignatureMultiplier(). Set factor to 1.0 here.
+    // When per-cell smoke lands, count smokeCells from the ray and apply:
+    //   smokeFactor = sensorTier === 'thermal' ? LOS_SMOKE_THERMAL : LOS_SMOKE_OPTICAL
+    //   if smokeCells >= LOS_SMOKE_BLOCK_COUNT: blocked entirely
+    let smokeFactor = 1.0;
+    if (losResult.smokeCells >= LOS_SMOKE_BLOCK_COUNT) {
+        return { woodlandFactor: 0, smokeFactor: 0, isBlocked: true };
+    }
+    else if (losResult.smokeCells >= 1) {
+        smokeFactor = sensorTier === 'thermal' ? LOS_SMOKE_THERMAL : LOS_SMOKE_OPTICAL;
+    }
     return { woodlandFactor, smokeFactor, isBlocked: false };
 }
 // ============================================================================
@@ -307,6 +321,9 @@ export function updateSpotting(units, contacts, spatialHash, terrain, currentTic
     // Player units observe enemy units, and vice versa
     const allUnits = [...units.values()];
     const aliveUnits = allUnits.filter((u) => !u.isDestroyed && u.moraleState !== 'surrendered');
+    // Aggregate targets observed this second per owner/faction.
+    // Decay should happen once per owner after all their observers have contributed.
+    const observedByOwner = new Map();
     for (const observer of aliveUnits) {
         // Get or create the contact map for this observer's owner
         let ownerContacts = contacts.get(observer.ownerId);
@@ -314,18 +331,23 @@ export function updateSpotting(units, contacts, spatialHash, terrain, currentTic
             ownerContacts = new Map();
             contacts.set(observer.ownerId, ownerContacts);
         }
+        let ownerObservedTargets = observedByOwner.get(observer.ownerId);
+        if (!ownerObservedTargets) {
+            ownerObservedTargets = new Set();
+            observedByOwner.set(observer.ownerId, ownerObservedTargets);
+        }
         // Look up observer's UnitType for visionM, unitClass, moveClass
         const observerType = unitTypes?.get(observer.unitTypeId);
         const observerVisionM = observerType?.visionM ?? 1500;
+        const observerVisionCells = observerVisionM / CELL_REAL_M;
         const observerClass = observerType?.unitClass ?? 'infantry';
         const observerMoveClass = observerType?.moveClass ?? 'leg';
         const observerSize = observerType?.size ?? 3;
         const sensorTier = getSensorTier(observerVisionM);
         // Use spatial hash to find candidate targets within max sensor range
+        // Positions are in grid cells; convert vision from metres to cells
         const observerPos = { x: observer.posX, z: observer.posZ };
-        const candidateIds = spatialHash.unitsInRange(observerPos, observerVisionM);
-        // Track which targets we processed this second (for decay of unobserved)
-        const observedTargetIds = new Set();
+        const candidateIds = spatialHash.unitsInRange(observerPos, observerVisionCells);
         for (const targetId of candidateIds) {
             const target = units.get(targetId);
             if (!target)
@@ -335,7 +357,6 @@ export function updateSpotting(units, contacts, spatialHash, terrain, currentTic
             // Skip friendly units — we don't spot our own side
             if (target.ownerId === observer.ownerId)
                 continue;
-            observedTargetIds.add(targetId);
             // Look up target's UnitType
             const targetType = unitTypes?.get(target.unitTypeId);
             const targetSize = targetType?.size ?? 3;
@@ -343,11 +364,10 @@ export function updateSpotting(units, contacts, spatialHash, terrain, currentTic
             // --- Compute effective detection range ---
             const signatureMult = targetSignatureMultiplier(target);
             const observerMod = observerQualityMod(observer, observerMoveClass, observerClass);
-            let effectiveRange = observerVisionM * signatureMult * observerMod;
+            let effectiveRange = observerVisionCells * signatureMult * observerMod;
             // Apply LOS obstruction factors (woodland, smoke)
             const obstruction = losObstructionFactors(observerPos, { x: target.posX, z: target.posZ }, sensorTier, terrain, observerMoveClass, observerSize, targetMoveClass, targetSize, false);
             if (obstruction.isBlocked) {
-                decayContact(ownerContacts, targetId, currentTick);
                 continue;
             }
             effectiveRange *= obstruction.woodlandFactor * obstruction.smokeFactor;
@@ -355,14 +375,14 @@ export function updateSpotting(units, contacts, spatialHash, terrain, currentTic
             const actualDistance = Math.sqrt((target.posX - observer.posX) ** 2 +
                 (target.posZ - observer.posZ) ** 2);
             if (actualDistance > effectiveRange) {
-                decayContact(ownerContacts, targetId, currentTick);
                 continue;
             }
             // --- LOS check (terrain elevation) ---
             if (!hasLineOfSight(observerPos, { x: target.posX, z: target.posZ }, terrain, observerMoveClass, observerSize, targetMoveClass, targetSize, false)) {
-                decayContact(ownerContacts, targetId, currentTick);
                 continue;
             }
+            // This target is truly observed (range + LOS) by this owner this second.
+            ownerObservedTargets.add(targetId);
             // --- Radar special case ---
             // Radar: moving target -> instantly set to floor of DETECTED (25)
             // Cannot accumulate above 25 via radar alone
@@ -407,9 +427,12 @@ export function updateSpotting(units, contacts, spatialHash, terrain, currentTic
             contact.lostAt = null;
             updateContactPosition(contact, target);
         }
-        // --- Decay contacts for targets NOT observed this second ---
-        for (const [targetId, contact] of ownerContacts) {
-            if (observedTargetIds.has(targetId))
+    }
+    // --- Decay contacts once per owner for targets not observed this second ---
+    for (const [ownerId, ownerContacts] of contacts) {
+        const observedTargets = observedByOwner.get(ownerId) ?? new Set();
+        for (const [targetId] of ownerContacts) {
+            if (observedTargets.has(targetId))
                 continue;
             decayContact(ownerContacts, targetId, currentTick);
         }
@@ -467,10 +490,14 @@ function decayContact(ownerContacts, targetId, currentTick) {
     const contact = ownerContacts.get(targetId);
     if (!contact)
         return;
-    // Already lost — check if it should be removed entirely
+    // Already lost — remove entirely after LOST_DISPLAY_FADE_SEC (60s)
     if (contact.detectionTier === 'LOST') {
-        // TODO: Check if LOST_DISPLAY_FADE_SEC (60s) has elapsed since lostAt
-        //       If so, remove the contact from the map entirely.
+        if (contact.lostAt !== null) {
+            const elapsedSec = (currentTick - contact.lostAt) / TICKS_PER_SEC;
+            if (elapsedSec >= LOST_DISPLAY_FADE_SEC) {
+                ownerContacts.delete(targetId);
+            }
+        }
         return;
     }
     // Decay at 8 pts/sec
